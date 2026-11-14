@@ -1,38 +1,35 @@
-//! Crate `aurora-factory` — Fábrica de entregables multimodales (Stub de Fase 0).
+//! Crate `aurora-factory` — Fábrica Multimodal de Dossiers PDF, Locución TTS
+//! en CPU/RAM y Reels Verticales con FFmpeg/NVENC bajo supervisión Gatekeeper (Fase 4).
 //!
-//! En Fase 4 implementará generación local de dossiers PDF, síntesis TTS en CPU
-//! y ensamblaje de video vertical MP4 con apoyo de `ffmpeg`/NVENC bajo supervisión
-//! del Gatekeeper (`EstadoAprobacion`).
+//! Invariantes de hardware y seguridad:
+//! - Cero bypass de Gatekeeper: exige `EstadoAprobacion::Aprobado` y `!opt_out` antes de escribir en NVMe.
+//! - TTS (`piper`) y maquetado HTML/PDF/PNG (`chromium --disable-gpu`) operan 100% en CPU/RAM.
+//! - `FfmpegNvencComposer` prioriza `h264_nvenc` con fallback automático a `libx264`.
 
-use aurora_domain::{AuroraError, AuroraResult};
-use tracing::debug;
+pub mod document;
+pub mod error;
+pub mod manifest;
+pub mod pipeline;
+pub mod tts;
+pub mod video;
 
-/// Descriptor de estado para el módulo Factory en Fase 0.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FactoryStubStatus {
-    /// Fase objetivo de implementación completa.
-    pub target_phase: u8,
-    /// Indica si los pipelines multimodales están habilitados.
-    pub enabled: bool,
-}
-
-/// Verifica disponibilidad del stub Factory en Fase 0.
-pub fn phase0_readiness() -> AuroraResult<FactoryStubStatus> {
-    let status = FactoryStubStatus {
-        target_phase: 4,
-        enabled: false,
-    };
-    debug!(
-        target_phase = status.target_phase,
-        enabled = status.enabled,
-        "aurora-factory inicializado como stub de Fase 0"
-    );
-    Ok(status)
-}
-
-/// Punto de entrada reservado para Fase 4; retorna error controlado en Fase 0.
-pub async fn not_implemented_yet() -> AuroraResult<()> {
-    Err(AuroraError::Validacion(
-        "aurora-factory se implementará en Fase 4".to_string(),
-    ))
-}
+pub use document::{
+    generar_html_dossier, generar_html_escena, sanitizar_html, ConfigHeadlessBrowser,
+    DeterministicMockDocumentEngine, DocumentEngine, HeadlessBrowserDocumentEngine,
+    REEL_ALTO_PX, REEL_ANCHO_PX,
+};
+pub use error::{FactoryError, FactoryResult};
+pub use manifest::{
+    construir_metadatos_artefacto, fnv1a_64_bytes, sha256_bytes, MetadatosArtefacto,
+    PaqueteManufacturado, SolicitudManufactura,
+};
+pub use pipeline::{ConfigFabrica, FabricaMultimodalAurora};
+pub use tts::{
+    generar_wav_pcm_silencio, leer_info_wav, length_scale_para_perfil, ConfigPiperCpu,
+    DeterministicSilentWavEngine, PiperCpuTtsEngine, ResultadoAudio, TtsEngine,
+    DEFAULT_SAMPLE_RATE_HZ,
+};
+pub use video::{
+    formatear_timestamp_srt, generar_subtitulos_srt, CodecVideoUsado, ConfigFfmpeg,
+    DeterministicMockVideoComposer, FfmpegNvencComposer, ResultadoVideo, VideoComposer,
+};

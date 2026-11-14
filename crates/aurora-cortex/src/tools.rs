@@ -352,16 +352,91 @@ impl OrdenProduccionActivo {
         })
     }
 
-    /// Devuelve el estado obligatorio de Gatekeeper para la orden.
+    /// Devuelve el estado actual de Gatekeeper para la orden.
     #[must_use]
     pub const fn estado_gatekeeper(&self) -> EstadoAprobacion {
         self.estado_gatekeeper
     }
 
-    /// Devuelve los 4 activos iniciales registrados en espera de aprobación humana.
+    /// Alias ergonómico para consultar el [`EstadoAprobacion`] actual de la orden.
+    #[must_use]
+    pub const fn estado(&self) -> EstadoAprobacion {
+        self.estado_gatekeeper
+    }
+
+    /// Devuelve los 4 activos iniciales registrados en la orden.
     #[must_use]
     pub fn activos_iniciales(&self) -> &[ActivoGenerado] {
         &self.activos_iniciales
+    }
+
+    /// Transiciona la orden y todos sus activos de `PendienteGatekeeper` a `Aprobado`.
+    ///
+    /// Bloquea la transición si la orden ya fue rechazada o despachada previamente.
+    pub fn aprobar_gatekeeper(&mut self) -> CortexResult<()> {
+        match self.estado_gatekeeper {
+            EstadoAprobacion::PendienteGatekeeper => {
+                let ahora = Utc::now();
+                for activo in &mut self.activos_iniciales {
+                    if activo.estado != EstadoAprobacion::PendienteGatekeeper {
+                        return Err(CortexError::BloqueoGatekeeper {
+                            prospecto_id: self.prospecto_id,
+                            motivo: format!(
+                                "el activo {} no se encontraba en PendienteGatekeeper",
+                                activo.id
+                            ),
+                        });
+                    }
+                    activo.estado = EstadoAprobacion::Aprobado;
+                    activo.actualizado_en = ahora;
+                    activo.motivo_rechazo = None;
+                    validar_activo(activo)?;
+                }
+                self.estado_gatekeeper = EstadoAprobacion::Aprobado;
+                info!(
+                    orden_id = %self.orden_id,
+                    prospecto_id = %self.prospecto_id,
+                    "OrdenProduccionActivo aprobada explícitamente por Gatekeeper"
+                );
+                Ok(())
+            }
+            EstadoAprobacion::Aprobado => Ok(()),
+            EstadoAprobacion::Rechazado | EstadoAprobacion::Despachado => {
+                Err(CortexError::BloqueoGatekeeper {
+                    prospecto_id: self.prospecto_id,
+                    motivo: format!(
+                        "transición inválida hacia Aprobado desde {:?}",
+                        self.estado_gatekeeper
+                    ),
+                })
+            }
+        }
+    }
+
+    /// Rechaza explícitamente la orden en el Gatekeeper registrando el motivo obligatorio.
+    pub fn rechazar_gatekeeper(&mut self, motivo: impl Into<String>) -> CortexResult<()> {
+        let motivo_limpio = motivo.into();
+        if motivo_limpio.trim().is_empty() {
+            return Err(CortexError::BloqueoGatekeeper {
+                prospecto_id: self.prospecto_id,
+                motivo: "el rechazo en Gatekeeper requiere motivo no vacío".to_string(),
+            });
+        }
+        let ahora = Utc::now();
+        for activo in &mut self.activos_iniciales {
+            activo.estado = EstadoAprobacion::Rechazado;
+            activo.actualizado_en = ahora;
+            activo.motivo_rechazo = Some(motivo_limpio.clone());
+            validar_activo(activo)?;
+        }
+        self.estado_gatekeeper = EstadoAprobacion::Rechazado;
+        warn!(
+            orden_id = %self.orden_id,
+            prospecto_id = %self.prospecto_id,
+            motivo = %motivo_limpio,
+            "OrdenProduccionActivo rechazada en Gatekeeper"
+        );
+        Ok(())
     }
 
     /// Verifica explícitamente que ni la orden ni ningún activo hayan saltado el Gatekeeper.

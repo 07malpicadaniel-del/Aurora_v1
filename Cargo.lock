@@ -72,10 +72,17 @@ dependencies = [
 name = "aurora-factory"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "aurora-cortex",
  "aurora-domain",
+ "aurora-memory",
+ "aurora-osint",
+ "chrono",
+ "serde",
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
