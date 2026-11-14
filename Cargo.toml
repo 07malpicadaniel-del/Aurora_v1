@@ -3,6 +3,7 @@ members = [
     "crates/aurora-domain",
     "crates/aurora-osint",
     "crates/aurora-memory",
+    "crates/aurora-cortex",
     "crates/aurora-factory",
     "crates/aurora-pulse",
 ]
@@ -35,6 +36,7 @@ parking_lot = "0.12"
 aurora-domain = { path = "crates/aurora-domain" }
 aurora-osint = { path = "crates/aurora-osint" }
 aurora-memory = { path = "crates/aurora-memory" }
+aurora-cortex = { path = "crates/aurora-cortex" }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

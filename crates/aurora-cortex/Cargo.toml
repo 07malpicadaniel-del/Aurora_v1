@@ -1,0 +1,25 @@
+[package]
+name = "aurora-cortex"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+aurora-domain.workspace = true
+aurora-memory.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+aurora-osint.workspace = true
+
+[lints]
+workspace = true
