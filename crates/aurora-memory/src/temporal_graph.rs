@@ -349,6 +349,104 @@ impl GrafoTemporal4D {
     pub fn iter_relaciones(&self) -> impl Iterator<Item = &RelacionTopologica> {
         self.relaciones_unicas.values()
     }
+
+    /// Recalibra la tasa de decaimiento 4D nocturno (`lambda_por_dia`) según el factor emitido
+    /// por el rol `Auditor` en `[0.5, 1.5]`. Un factor > 1.0 reduce el decaimiento para sostener
+    /// ventanas activas; un factor < 1.0 acelera el enfriamiento de oportunidades de bajo impacto.
+    pub fn recalibrar_decaimiento_nocturno(&mut self, factor_urgencia: f32) -> (f32, f32) {
+        let factor = if factor_urgencia.is_finite() {
+            factor_urgencia.clamp(0.5, 1.5)
+        } else {
+            1.0
+        };
+        let lambda_anterior = self.config.lambda_por_dia;
+        let lambda_nuevo = (lambda_anterior / factor).clamp(0.01, 0.25);
+        self.config.lambda_por_dia = lambda_nuevo;
+        debug!(
+            lambda_anterior,
+            lambda_nuevo, factor, "Tasa de decaimiento 4D recalibrada en consolidación nocturna"
+        );
+        (lambda_anterior, lambda_nuevo)
+    }
+
+    /// Refuerza o atenúa pesos de gatillos e hiperaristas pertenecientes a una `isla_objetivo`
+    /// (o de todo el grafo si `isla_objetivo` es `None`), manteniendo los valores en `[0.05, 1.0]`.
+    pub fn ajustar_pesos_isla_y_relaciones(
+        &mut self,
+        isla_objetivo: Option<IslaVertical>,
+        multiplicador: f32,
+    ) -> (usize, usize) {
+        let mult = if multiplicador.is_finite() {
+            multiplicador.clamp(0.5, 1.5)
+        } else {
+            1.0
+        };
+
+        let mut nodos_afectados = HashSet::new();
+        for reg in self.nodos.values_mut() {
+            let coincide = isla_objetivo.is_none_or(|isla| reg.isla == isla);
+            if coincide {
+                nodos_afectados.insert(reg.node_id);
+                for g in &mut reg.prospecto.gatillos {
+                    g.peso_urgencia = (g.peso_urgencia * mult).clamp(0.05, 1.0);
+                }
+            }
+        }
+
+        let mut aristas_ajustadas = 0_usize;
+        for (origen_id, lista) in &mut self.vecinos {
+            for arista in lista.iter_mut() {
+                if nodos_afectados.contains(origen_id)
+                    || nodos_afectados.contains(&arista.vecino_node_id)
+                {
+                    arista.fuerza = (arista.fuerza * mult).clamp(0.05, 1.0);
+                    aristas_ajustadas += 1;
+                }
+            }
+        }
+
+        for ((a, b, _), rel) in &mut self.relaciones_unicas {
+            if nodos_afectados.contains(a) || nodos_afectados.contains(b) {
+                rel.fuerza = (rel.fuerza * mult).clamp(0.05, 1.0);
+            }
+        }
+
+        (nodos_afectados.len(), aristas_ajustadas)
+    }
+
+    /// Ajusta la fuerza de las hiperaristas y gatillos vinculados a un prospecto específico.
+    pub fn ajustar_peso_prospecto(&mut self, prospecto_id: Uuid, multiplicador: f32) -> usize {
+        let mult = if multiplicador.is_finite() {
+            multiplicador.clamp(0.5, 1.5)
+        } else {
+            1.0
+        };
+        let target_id = uuid_a_node_id_u64(prospecto_id);
+
+        if let Some(reg) = self.nodos.get_mut(&target_id) {
+            for g in &mut reg.prospecto.gatillos {
+                g.peso_urgencia = (g.peso_urgencia * mult).clamp(0.05, 1.0);
+            }
+        }
+
+        let mut aristas_ajustadas = 0_usize;
+        for (origen_id, lista) in &mut self.vecinos {
+            for arista in lista.iter_mut() {
+                if *origen_id == target_id || arista.vecino_node_id == target_id {
+                    arista.fuerza = (arista.fuerza * mult).clamp(0.05, 1.0);
+                    aristas_ajustadas += 1;
+                }
+            }
+        }
+
+        for ((a, b, _), rel) in &mut self.relaciones_unicas {
+            if *a == target_id || *b == target_id {
+                rel.fuerza = (rel.fuerza * mult).clamp(0.05, 1.0);
+            }
+        }
+
+        aristas_ajustadas
+    }
 }
 
 fn upsert_arista(lista: &mut Vec<AristaTelarana>, nueva: AristaTelarana) {

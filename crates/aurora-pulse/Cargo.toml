@@ -7,9 +7,21 @@ authors.workspace = true
 
 [dependencies]
 aurora-domain.workspace = true
+aurora-memory.workspace = true
+aurora-cortex.workspace = true
+aurora-factory.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+aurora-osint.workspace = true
 
 [lints]
 workspace = true

@@ -1,37 +1,36 @@
-//! Crate `aurora-pulse` — Orquestación de despacho, pulso y puente hacia Axis (Stub de Fase 0).
+//! Crate `aurora-pulse` — Distribución algorítmica, calentamiento periférico,
+//! telemetría comercial con cumplimiento LFPDPPP inmediato y consolidación DPO nocturna.
 //!
-//! En Fase 5 implementará colas de despacho supervisado por Gatekeeper y telemetría
-//! headless hacia el frontend de escritorio en `../axis_v1` (Tauri v2).
+//! Actúa como capa de ejecución controlada tras `aurora-cortex` (Fase 3) y
+//! `aurora-factory` (Fase 4), aplicando siempre:
+//! - Barrera estricta de **Gatekeeper Zero-Bypass** (`EstadoAprobacion::Aprobado`).
+//! - Bloqueo y purga física **LFPDPPP** inmediata ante señales `opt_out`.
+//! - Control conservador de tasa, jitter determinista y circuit breakers por plataforma.
+//! - Retroalimentación nocturna al hipergrafo 4D y generación de datasets JSONL DPO para BOB.
 
-use aurora_domain::{AuroraError, AuroraResult};
-use tracing::debug;
+pub mod dispatcher;
+pub mod dpo_loop;
+pub mod error;
+pub mod rate_limiter;
+pub mod telemetry;
+pub mod warmup;
 
-/// Descriptor de estado para el módulo Pulse en Fase 0.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PulseStubStatus {
-    /// Fase objetivo de implementación completa.
-    pub target_phase: u8,
-    /// Indica si los conectores de despacho están habilitados.
-    pub enabled: bool,
-}
-
-/// Verifica disponibilidad del stub Pulse en Fase 0.
-pub fn phase0_readiness() -> AuroraResult<PulseStubStatus> {
-    let status = PulseStubStatus {
-        target_phase: 5,
-        enabled: false,
-    };
-    debug!(
-        target_phase = status.target_phase,
-        enabled = status.enabled,
-        "aurora-pulse inicializado como stub de Fase 0"
-    );
-    Ok(status)
-}
-
-/// Punto de entrada reservado para Fase 5; retorna error controlado en Fase 0.
-pub async fn not_implemented_yet() -> AuroraResult<()> {
-    Err(AuroraError::Validacion(
-        "aurora-pulse se implementará en Fase 5".to_string(),
-    ))
-}
+pub use dispatcher::{
+    ChannelTransport, ComprobanteDespacho, DespachadorMulticanal, DeterministicMockTransport,
+    EstadoCampanaProspecto, OrdenDespacho,
+};
+pub use dpo_loop::{
+    ConfigConsolidacionNocturna, DatasetPreferenciasDpo, EntradaPreferenciaDpo,
+    MotorConsolidacionNocturna,
+};
+pub use error::{PulseError, PulseResult};
+pub use rate_limiter::{
+    ControladorTasaPlataforma, EstadoTasaPlataforma, PlataformaPulso, PoliticaTasaPlataforma,
+};
+pub use telemetry::{
+    EventoTelemetria, RecolectorTelemetria, ResumenGanchoTelemetria, TipoEventoTelemetria,
+};
+pub use warmup::{
+    ConfigCalentamiento, DeterministicMockWarmupDriver, GestorCalentamientoPeriferico,
+    RegistroInteraccion, SocialWarmupDriver,
+};

@@ -481,6 +481,7 @@ pub struct CalentamientoPendiente {
     /// Fecha de creación UTC.
     pub creado_en: DateTime<Utc>,
     estado_gatekeeper: EstadoAprobacion,
+    motivo_rechazo: Option<String>,
 }
 
 impl CalentamientoPendiente {
@@ -502,13 +503,66 @@ impl CalentamientoPendiente {
             contexto_publico,
             creado_en: Utc::now(),
             estado_gatekeeper: EstadoAprobacion::PendienteGatekeeper,
+            motivo_rechazo: None,
         }
     }
 
-    /// Devuelve el estado obligatorio de Gatekeeper.
+    /// Devuelve el estado actual en Gatekeeper.
     #[must_use]
     pub const fn estado_gatekeeper(&self) -> EstadoAprobacion {
         self.estado_gatekeeper
+    }
+
+    /// Alias ergonómico para consultar el [`EstadoAprobacion`] actual.
+    #[must_use]
+    pub const fn estado(&self) -> EstadoAprobacion {
+        self.estado_gatekeeper
+    }
+
+    /// Devuelve el motivo de rechazo cuando la acción fue rechazada en Gatekeeper.
+    #[must_use]
+    pub fn motivo_rechazo(&self) -> Option<&str> {
+        self.motivo_rechazo.as_deref()
+    }
+
+    /// Transiciona la solicitud de calentamiento desde `PendienteGatekeeper` a `Aprobado`.
+    pub fn aprobar_gatekeeper(&mut self) -> CortexResult<()> {
+        match self.estado_gatekeeper {
+            EstadoAprobacion::PendienteGatekeeper => {
+                self.estado_gatekeeper = EstadoAprobacion::Aprobado;
+                self.motivo_rechazo = None;
+                info!(
+                    calentamiento_id = %self.calentamiento_id,
+                    prospecto_id = %self.prospecto_id,
+                    "CalentamientoPendiente aprobado por Gatekeeper"
+                );
+                Ok(())
+            }
+            EstadoAprobacion::Aprobado => Ok(()),
+            EstadoAprobacion::Rechazado | EstadoAprobacion::Despachado => {
+                Err(CortexError::BloqueoGatekeeper {
+                    prospecto_id: self.prospecto_id,
+                    motivo: format!(
+                        "transición inválida de calentamiento hacia Aprobado desde {:?}",
+                        self.estado_gatekeeper
+                    ),
+                })
+            }
+        }
+    }
+
+    /// Rechaza explícitamente el calentamiento registrando un motivo obligatorio.
+    pub fn rechazar_gatekeeper(&mut self, motivo: impl Into<String>) -> CortexResult<()> {
+        let motivo_limpio = motivo.into();
+        if motivo_limpio.trim().is_empty() {
+            return Err(CortexError::BloqueoGatekeeper {
+                prospecto_id: self.prospecto_id,
+                motivo: "el rechazo en Gatekeeper requiere motivo no vacío".to_string(),
+            });
+        }
+        self.estado_gatekeeper = EstadoAprobacion::Rechazado;
+        self.motivo_rechazo = Some(motivo_limpio);
+        Ok(())
     }
 }
 

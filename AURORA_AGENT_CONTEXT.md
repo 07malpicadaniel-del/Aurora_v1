@@ -40,7 +40,7 @@ Para evitar saturación térmica y errores OOM en sesiones autónomas largas:
 | `aurora-memory` | `crates/aurora-memory` | **Completa (Fase 2)** | Telaraña topológica 4D, embeddings multilingües CPU/RAM, islas vectoriales SIMD y WAL NVMe con purga física LFPDPPP. |
 | `aurora-cortex` | `crates/aurora-cortex` | **Completa (Fase 3)** | Córtex comercial de BOB (`Perfilador`, `DirectorCreativo`, `Auditor`), gramáticas GBNF estrictas y `ToolDispatcher` bajo Gatekeeper. |
 | `aurora-factory` | `crates/aurora-factory` | **Completa (Fase 4)** | Fábrica multimodal local (`DossierPdf`, `NotaVozTts` CPU/RAM, `ReelVerticalMp4` FFmpeg/NVENC con fallback `libx264` y barrera Gatekeeper Zero-Bypass). |
-| `aurora-pulse` | `crates/aurora-pulse` | Stub (Fase 5) | Colas de despacho supervisado por Gatekeeper y puente hacia `../axis_v1`. |
+| `aurora-pulse` | `crates/aurora-pulse` | **Completa (Fase 5)** | Calentamiento periférico 24–72 h, rate-limiting/circuit breakers, despachador multicanal SHA-256 bajo Gatekeeper Zero-Bypass, telemetría con purga LFPDPPP inmediata y ciclo nocturno DPO en JSONL. |
 
 ## 5. Reglas de Calidad Inquebrantables
 

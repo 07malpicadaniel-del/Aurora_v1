@@ -132,6 +132,12 @@ impl MotorMemoriaAurora {
         &self.grafo
     }
 
+    /// Acceso mutable al grafo temporal 4D para recalibración nocturna de pesos y decaimiento.
+    #[must_use]
+    pub fn grafo_mut(&mut self) -> &mut GrafoTemporal4D {
+        &mut self.grafo
+    }
+
     /// Acceso de solo lectura al embedder CPU configurado.
     #[must_use]
     pub fn embedder(&self) -> &Arc<dyn TextEmbedder> {

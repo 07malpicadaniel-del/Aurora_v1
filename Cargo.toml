@@ -38,6 +38,7 @@ aurora-osint = { path = "crates/aurora-osint" }
 aurora-memory = { path = "crates/aurora-memory" }
 aurora-cortex = { path = "crates/aurora-cortex" }
 aurora-factory = { path = "crates/aurora-factory" }
+aurora-pulse = { path = "crates/aurora-pulse" }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
