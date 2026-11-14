@@ -12,6 +12,7 @@ pub mod dispatcher;
 pub mod dpo_loop;
 pub mod error;
 pub mod rate_limiter;
+pub mod smtp_transport;
 pub mod telemetry;
 pub mod warmup;
 
@@ -27,6 +28,7 @@ pub use error::{PulseError, PulseResult};
 pub use rate_limiter::{
     ControladorTasaPlataforma, EstadoTasaPlataforma, PlataformaPulso, PoliticaTasaPlataforma,
 };
+pub use smtp_transport::{ConfigSmtp, SmtpEmailTransport};
 pub use telemetry::{
     EventoTelemetria, RecolectorTelemetria, ResumenGanchoTelemetria, TipoEventoTelemetria,
 };

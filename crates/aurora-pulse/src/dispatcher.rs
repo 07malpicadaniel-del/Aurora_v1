@@ -53,6 +53,9 @@ pub struct OrdenDespacho {
     pub url_propuesta_tracking: String,
     /// Cadencia sugerida en horas para el próximo punto de seguimiento (`48` h por defecto).
     pub cadencia_seguimiento_horas: u16,
+    /// Correo electrónico explícito de destino cuando aplica despacho por `CorreoEjecutivo`.
+    #[serde(default)]
+    pub correo_destino: Option<String>,
 }
 
 /// Comprobante trazable emitido tras despachar un paquete multimodal.
@@ -146,6 +149,29 @@ impl<T: ChannelTransport> DespachadorMulticanal<T> {
         memoria: &MotorMemoriaAurora,
         ahora: DateTime<Utc>,
     ) -> PulseResult<ComprobanteDespacho> {
+        self.despachar_con_correo(paquete, prospecto, canal, None, memoria, ahora)
+            .await
+    }
+
+    /// Variante que adjunta explícitamente un correo destino verificado para `CorreoEjecutivo`.
+    #[tracing::instrument(
+        skip(self, paquete, prospecto, memoria),
+        fields(
+            orden_id = %paquete.orden_id,
+            campana_id = %paquete.campana_id,
+            prospecto_id = %prospecto.id,
+            canal = ?canal
+        )
+    )]
+    pub async fn despachar_con_correo(
+        &self,
+        paquete: &PaqueteManufacturado,
+        prospecto: &Prospecto,
+        canal: CanalContacto,
+        correo_destino: Option<String>,
+        memoria: &MotorMemoriaAurora,
+        ahora: DateTime<Utc>,
+    ) -> PulseResult<ComprobanteDespacho> {
         // 1. Cumplimiento estricto LFPDPPP
         if prospecto.lfpdppp.opt_out || memoria.esta_en_blacklist(prospecto.id) {
             warn!(
@@ -227,6 +253,7 @@ impl<T: ChannelTransport> DespachadorMulticanal<T> {
             paquete: paquete.clone(),
             url_propuesta_tracking: url_propuesta_tracking.clone(),
             cadencia_seguimiento_horas: self.cadencia_seguimiento_horas,
+            correo_destino,
         };
 
         let mut comprobante = match self.transport.enviar_paquete(&envio).await {

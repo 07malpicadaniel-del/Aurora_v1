@@ -177,6 +177,7 @@ async fn flujo_http_completo_hunt_gatekeeper_factory_pulse_dpo_y_opt_out(
         ))
         .json(&AprobarOrdenRequest {
             despachar_inmediatamente: Some(true),
+            correo_destino: None,
         })
         .send()
         .await?;

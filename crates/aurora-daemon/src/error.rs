@@ -68,6 +68,10 @@ pub enum DaemonError {
     /// Fallo interno de sincronización o persistencia en NVMe.
     #[error("error interno del demonio: {0}")]
     Interno(String),
+
+    /// Error de carga o validación de configuración TOML/variables de entorno.
+    #[error("error de configuración de aurora-daemon: {0}")]
+    Configuracion(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -126,6 +130,7 @@ impl IntoResponse for DaemonError {
             }
             Self::Pulso(_) => (StatusCode::INTERNAL_SERVER_ERROR, "PULSE_ERROR"),
             Self::Interno(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
+            Self::Configuracion(_) => (StatusCode::INTERNAL_SERVER_ERROR, "CONFIG_ERROR"),
         };
 
         let detalle = self.to_string();

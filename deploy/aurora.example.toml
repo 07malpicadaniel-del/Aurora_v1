@@ -1,0 +1,52 @@
+# Configuración de ejemplo para aurora-daemon (Aurora v2 en Arch Linux)
+# Copiar a ~/.config/aurora/aurora.toml o apuntar con AURORA_CONFIG_PATH
+
+# Dirección HTTP/WebSocket/SSE local consumida por el Cockpit axis_v1
+bind_addr = "127.0.0.1:8090"
+
+# Endpoint único del modelo residente en RTX 5060 Ti (slot_id = 0 obligatorio)
+bob_url = "http://127.0.0.1:8085"
+bob_slot_id = 0
+
+# Rutas XDG en NVMe local (~ se expande a $HOME)
+data_dir = "~/.local/share/aurora"
+# Opcionalmente personalizables por separado:
+# wal_dir = "~/.local/share/aurora/wal"
+# artefactos_dir = "~/.local/share/aurora/artefactos"
+# dpo_dir = "~/.local/share/aurora/dpo"
+
+# Modo de operación:
+# - "real_con_fallback": usa motores reales y cae limpio a respaldo si falta un servicio/binario
+# - "estricto_real": exige BOB, Piper, Chromium y FFmpeg reales al arranque
+# - "simulado_offline": adaptadores deterministas en memoria para CI/pruebas
+modo_ejecucion = "real_con_fallback"
+modo_offline = false
+
+# Locución neuronal en CPU/RAM (Ryzen 9, 0 MB VRAM)
+piper_bin = "piper"
+piper_model = "~/.local/share/aurora/models/tts/es_MX-ald-medium.onnx"
+# piper_speaker_id = 0
+
+# Navegador headless CPU (--headless=new --disable-gpu) y Chrome DevTools Protocol para SPAs
+chromium_bin = "chromium"
+cdp_url = "http://127.0.0.1:9222"
+
+# Compositor FFmpeg con aceleración RTX 5060 Ti NVENC y fallback libx264 CPU
+ffmpeg_bin = "ffmpeg"
+usar_nvenc = true
+
+[smtp]
+# Activa el transporte real tokio1-rustls-tls tras aprobación Gatekeeper y correo destino
+habilitado = false
+host = "smtp.resend.com"
+puerto = 587
+# usuario = "resend"
+# password se recomienda inyectar vía AURORA_SMTP_PASSWORD en EnvironmentFile
+remitente_nombre = "Aurora Inteligencia Comercial"
+remitente_correo = "aurora@localhost.localdomain"
+usar_tls_starttls = true
+usar_tls_implicito = false
+url_base_opt_out = "http://127.0.0.1:8090/api/v1/lfpdppp/opt-out"
+adjuntar_dossier_pdf = true
+adjuntar_reel_si_menor_a_mb = 12
+timeout_ms = 15000

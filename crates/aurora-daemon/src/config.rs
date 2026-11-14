@@ -1,0 +1,958 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use aurora_osint::{ConfigCdpFetcher, HttpCdpBrowserFetcher};
+use aurora_pulse::ConfigSmtp;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use tokio::process::Command;
+use tokio::time::timeout;
+
+use crate::error::{DaemonError, DaemonResult};
+
+/// Política de fallback entre adaptadores reales (BOB, Piper, Chromium, FFmpeg, CDP, SMTP)
+/// y respaldo determinista en CI/desarrollo sin hardware o dependencias auxiliares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModoEjecucion {
+    /// Prioriza motores reales del sistema y degrada limpiamente a respaldo solo si un binario/servicio falta.
+    #[default]
+    RealConFallback,
+    /// Exige ejecución 100 % real en el sistema (falla explícitamente si falta BOB/Piper/Chromium/FFmpeg/SMTP).
+    EstrictoReal,
+    /// Opera íntegramente con adaptadores deterministas en memoria (CI y pruebas automatizadas).
+    SimuladoOffline,
+}
+
+impl ModoEjecucion {
+    /// Etiqueta legible para UI y logs estructurados.
+    #[must_use]
+    pub const fn etiqueta(&self) -> &'static str {
+        match self {
+            Self::RealConFallback => "real_con_fallback",
+            Self::EstrictoReal => "estricto_real",
+            Self::SimuladoOffline => "simulado_offline",
+        }
+    }
+
+    fn desde_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "real_con_fallback" | "hybrid" | "hibrido" => Some(Self::RealConFallback),
+            "estricto_real" | "strict" | "estricto" | "prod" => Some(Self::EstrictoReal),
+            "simulado_offline" | "offline" | "mock" => Some(Self::SimuladoOffline),
+            _ => None,
+        }
+    }
+}
+
+/// Configuración unificada de `aurora-daemon` (compatible con TOML + overrides `AURORA_*`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuroraDaemonConfig {
+    /// Dirección IP y puerto de escucha (`127.0.0.1:8090` por defecto).
+    pub bind_addr: String,
+    /// Endpoint local de BOB `llama-server` (`http://127.0.0.1:8085` por defecto).
+    pub bob_url: String,
+    /// Ranura única asignada a Aurora en la GPU RTX 5060 Ti (`0`).
+    pub bob_slot_id: i32,
+    /// Directorio raíz en NVMe (`~/.local/share/aurora` por defecto en Arch Linux).
+    pub data_dir: PathBuf,
+    /// Compatibilidad con bandera booleana `AURORA_OFFLINE_MOCK`; cuando es `true` fuerza `SimuladoOffline`.
+    pub modo_offline: bool,
+    /// Modo de operación de adaptadores reales vs fallback determinista.
+    pub modo_ejecucion: ModoEjecucion,
+    /// Directorio explícito del WAL/snapshot 4D (si se omite, `<data_dir>/wal`).
+    pub wal_dir: Option<PathBuf>,
+    /// Directorio explícito de artefactos PDF/WAV/MP4/SRT (si se omite, `<data_dir>/artefactos`).
+    pub artefactos_dir: Option<PathBuf>,
+    /// Directorio explícito de datasets DPO JSONL (si se omite, `<data_dir>/dpo`).
+    pub dpo_dir: Option<PathBuf>,
+    /// Nombre o ruta al binario `piper` en CPU (`piper` o `~/.local/bin/piper`).
+    pub piper_bin: PathBuf,
+    /// Ruta al modelo `.onnx` en español mexicano (ej. `es_MX-claude-high.onnx`).
+    pub piper_model: PathBuf,
+    /// Speaker ID opcional para modelos Piper multi-voz.
+    pub piper_speaker_id: Option<u32>,
+    /// Nombre o ruta al navegador headless (`chromium`, `google-chrome-stable`, etc.).
+    pub chromium_bin: PathBuf,
+    /// Endpoint Chrome DevTools Protocol para hidratación JS de SPAs (`http://127.0.0.1:9222`).
+    pub cdp_url: String,
+    /// Binario `ffmpeg` del sistema (`ffmpeg` por defecto).
+    pub ffmpeg_bin: PathBuf,
+    /// Prioriza codificación hardware `h264_nvenc` (RTX 5060 Ti) con respaldo `libx264` CPU.
+    pub usar_nvenc: bool,
+    /// Configuración SMTP (`lettre` + `tokio1-rustls-tls`) y cumplimiento LFPDPPP `List-Unsubscribe`.
+    pub smtp: ConfigSmtp,
+}
+
+impl Default for AuroraDaemonConfig {
+    fn default() -> Self {
+        let base_xdg = directorio_datos_xdg_por_defecto();
+        Self {
+            bind_addr: "127.0.0.1:8090".to_string(),
+            bob_url: aurora_cortex::DEFAULT_BOB_URL.to_string(),
+            bob_slot_id: 0,
+            data_dir: base_xdg.clone(),
+            modo_offline: false,
+            modo_ejecucion: ModoEjecucion::RealConFallback,
+            wal_dir: None,
+            artefactos_dir: None,
+            dpo_dir: None,
+            piper_bin: PathBuf::from("piper"),
+            piper_model: base_xdg.join("models/tts/es_MX-ald-medium.onnx"),
+            piper_speaker_id: None,
+            chromium_bin: PathBuf::from("chromium"),
+            cdp_url: "http://127.0.0.1:9222".to_string(),
+            ffmpeg_bin: PathBuf::from("ffmpeg"),
+            usar_nvenc: true,
+            smtp: ConfigSmtp::default(),
+        }
+    }
+}
+
+impl AuroraDaemonConfig {
+    /// Carga configuración desde archivo TOML (`AURORA_CONFIG_PATH`, `./aurora.toml` o
+    /// `~/.config/aurora/aurora.toml`) y aplica variables de entorno `AURORA_*`.
+    pub fn cargar_desde_toml_y_entorno() -> DaemonResult<Self> {
+        Self::cargar_con_lector_entorno(None, |clave| std::env::var(clave).ok())
+    }
+
+    /// Variante determinista (ideal para tests unitarios e integración) sin mutar variables globales.
+    pub fn cargar_con_lector_entorno<F>(ruta_toml: Option<&Path>, leer_env: F) -> DaemonResult<Self>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let mut cfg = Self::default();
+
+        let ruta_efectiva = ruta_toml.map(PathBuf::from).or_else(|| {
+            if let Some(p) = leer_env("AURORA_CONFIG_PATH").filter(|s| !s.trim().is_empty()) {
+                return Some(expandir_tilde_path(Path::new(p.trim())));
+            }
+            let local = PathBuf::from("aurora.toml");
+            if local.is_file() {
+                return Some(local);
+            }
+            let home_cfg = directorio_config_xdg_por_defecto().join("aurora.toml");
+            if home_cfg.is_file() {
+                return Some(home_cfg);
+            }
+            None
+        });
+
+        if let Some(ref ruta) = ruta_efectiva {
+            let contenido = fs::read_to_string(ruta).map_err(|e| {
+                DaemonError::Configuracion(format!(
+                    "no se pudo leer configuración TOML '{}': {e}",
+                    ruta.display()
+                ))
+            })?;
+            cfg = toml::from_str::<Self>(&contenido).map_err(|e| {
+                DaemonError::Configuracion(format!(
+                    "TOML inválido en '{}': {e}",
+                    ruta.display()
+                ))
+            })?;
+        }
+
+        cfg.aplicar_overrides_entorno(&leer_env)?;
+        cfg.normalizar_y_validar()?;
+        Ok(cfg)
+    }
+
+    /// Devuelve el modo efectivo respetando tanto `modo_offline` legacy como `modo_ejecucion`.
+    #[must_use]
+    pub const fn modo_efectivo(&self) -> ModoEjecucion {
+        if self.modo_offline {
+            ModoEjecucion::SimuladoOffline
+        } else {
+            self.modo_ejecucion
+        }
+    }
+
+    /// Directorio raíz expandiendo `~/` al `$HOME` actual.
+    #[must_use]
+    pub fn data_dir_resuelto(&self) -> PathBuf {
+        expandir_tilde_path(&self.data_dir)
+    }
+
+    /// Directorio efectivo del WAL 4D (`wal_dir` explícito o `<data_dir>/wal`).
+    #[must_use]
+    pub fn wal_dir_efectivo(&self) -> PathBuf {
+        self.wal_dir
+            .as_ref()
+            .map(|p| expandir_tilde_path(p))
+            .unwrap_or_else(|| self.data_dir_resuelto().join("wal"))
+    }
+
+    /// Directorio efectivo de artefactos multimedia (`artefactos_dir` o `<data_dir>/artefactos`).
+    #[must_use]
+    pub fn artefactos_dir_efectivo(&self) -> PathBuf {
+        self.artefactos_dir
+            .as_ref()
+            .map(|p| expandir_tilde_path(p))
+            .unwrap_or_else(|| self.data_dir_resuelto().join("artefactos"))
+    }
+
+    /// Directorio efectivo de datasets DPO (`dpo_dir` o `<data_dir>/dpo`).
+    #[must_use]
+    pub fn dpo_dir_efectivo(&self) -> PathBuf {
+        self.dpo_dir
+            .as_ref()
+            .map(|p| expandir_tilde_path(p))
+            .unwrap_or_else(|| self.data_dir_resuelto().join("dpo"))
+    }
+
+    /// Ruta del archivo de respaldo persistente de la cola Gatekeeper.
+    #[must_use]
+    pub fn queue_path_efectivo(&self) -> PathBuf {
+        self.data_dir_resuelto().join("gatekeeper_queue.json")
+    }
+
+    /// Ruta resuelta del modelo Piper `.onnx`.
+    #[must_use]
+    pub fn piper_model_resuelto(&self) -> PathBuf {
+        expandir_tilde_path(&self.piper_model)
+    }
+
+    /// Resuelve el binario Chromium/Chrome disponible en Arch Linux.
+    #[must_use]
+    pub fn chromium_bin_efectivo(&self) -> PathBuf {
+        let cfg = expandir_tilde_path(&self.chromium_bin);
+        let candidatos = candidatos_chromium(&cfg);
+        resolver_binario_en_sistema(&cfg, &candidatos).unwrap_or(cfg)
+    }
+
+    /// Resuelve el binario Piper disponible en sistema (`piper`, `piper-tts`, `~/.local/bin/piper`, `/opt/piper/piper`).
+    #[must_use]
+    pub fn piper_bin_efectivo(&self) -> PathBuf {
+        let cfg = expandir_tilde_path(&self.piper_bin);
+        let candidatos = candidatos_piper(&cfg);
+        resolver_binario_en_sistema(&cfg, &candidatos).unwrap_or(cfg)
+    }
+
+    /// Resuelve el binario `ffmpeg` disponible en el sistema.
+    #[must_use]
+    pub fn ffmpeg_bin_efectivo(&self) -> PathBuf {
+        let cfg = expandir_tilde_path(&self.ffmpeg_bin);
+        resolver_binario_en_sistema(&cfg, &[]).unwrap_or(cfg)
+    }
+
+    fn aplicar_overrides_entorno<F>(&mut self, leer_env: &F) -> DaemonResult<()>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        if let Some(v) = leer_env("AURORA_BIND_ADDR").filter(|s| !s.trim().is_empty()) {
+            self.bind_addr = v.trim().to_string();
+        }
+        if let Some(v) = leer_env("AURORA_BOB_URL").filter(|s| !s.trim().is_empty()) {
+            self.bob_url = v.trim().to_string();
+        }
+        if let Some(v) = leer_env("AURORA_BOB_SLOT_ID").filter(|s| !s.trim().is_empty()) {
+            self.bob_slot_id = v.trim().parse::<i32>().map_err(|e| {
+                DaemonError::Configuracion(format!("AURORA_BOB_SLOT_ID inválido ('{v}'): {e}"))
+            })?;
+        }
+        if let Some(v) = leer_env("AURORA_DATA_DIR").filter(|s| !s.trim().is_empty()) {
+            self.data_dir = PathBuf::from(v.trim());
+        }
+        if let Some(v) = leer_env("AURORA_WAL_DIR").filter(|s| !s.trim().is_empty()) {
+            self.wal_dir = Some(PathBuf::from(v.trim()));
+        }
+        if let Some(v) = leer_env("AURORA_ARTEFACTOS_DIR").filter(|s| !s.trim().is_empty()) {
+            self.artefactos_dir = Some(PathBuf::from(v.trim()));
+        }
+        if let Some(v) = leer_env("AURORA_DPO_DIR").filter(|s| !s.trim().is_empty()) {
+            self.dpo_dir = Some(PathBuf::from(v.trim()));
+        }
+        if let Some(v) = leer_env("AURORA_PIPER_BIN").filter(|s| !s.trim().is_empty()) {
+            self.piper_bin = PathBuf::from(v.trim());
+        }
+        if let Some(v) = leer_env("AURORA_PIPER_MODEL").filter(|s| !s.trim().is_empty()) {
+            self.piper_model = PathBuf::from(v.trim());
+        }
+        if let Some(v) = leer_env("AURORA_PIPER_SPEAKER_ID").filter(|s| !s.trim().is_empty()) {
+            self.piper_speaker_id = Some(v.trim().parse::<u32>().map_err(|e| {
+                DaemonError::Configuracion(format!(
+                    "AURORA_PIPER_SPEAKER_ID inválido ('{v}'): {e}"
+                ))
+            })?);
+        }
+        if let Some(v) = leer_env("AURORA_CHROMIUM_BIN").filter(|s| !s.trim().is_empty()) {
+            self.chromium_bin = PathBuf::from(v.trim());
+        }
+        if let Some(v) = leer_env("AURORA_CDP_URL").filter(|s| !s.trim().is_empty()) {
+            self.cdp_url = v.trim().to_string();
+        }
+        if let Some(v) = leer_env("AURORA_FFMPEG_BIN").filter(|s| !s.trim().is_empty()) {
+            self.ffmpeg_bin = PathBuf::from(v.trim());
+        }
+        if let Some(v) = leer_env("AURORA_USAR_NVENC").filter(|s| !s.trim().is_empty()) {
+            self.usar_nvenc = parsear_bool_env("AURORA_USAR_NVENC", &v)?;
+        }
+        if let Some(v) = leer_env("AURORA_MODO_EJECUCION").filter(|s| !s.trim().is_empty()) {
+            let parsed = ModoEjecucion::desde_str(&v).ok_or_else(|| {
+                DaemonError::Configuracion(format!(
+                    "AURORA_MODO_EJECUCION inválido '{v}' (usa real_con_fallback | estricto_real | simulado_offline)"
+                ))
+            })?;
+            self.modo_ejecucion = parsed;
+            self.modo_offline = matches!(parsed, ModoEjecucion::SimuladoOffline);
+        }
+        if let Some(v) = leer_env("AURORA_OFFLINE_MOCK").filter(|s| !s.trim().is_empty()) {
+            let offline = parsear_bool_env("AURORA_OFFLINE_MOCK", &v)?;
+            self.modo_offline = offline;
+            if offline {
+                self.modo_ejecucion = ModoEjecucion::SimuladoOffline;
+            }
+        }
+
+        // Overrides SMTP
+        if let Some(v) = leer_env("AURORA_SMTP_HABILITADO").filter(|s| !s.trim().is_empty()) {
+            self.smtp.habilitado = parsear_bool_env("AURORA_SMTP_HABILITADO", &v)?;
+        }
+        if let Some(v) = leer_env("AURORA_SMTP_HOST").filter(|s| !s.trim().is_empty()) {
+            self.smtp.host = v.trim().to_string();
+        }
+        if let Some(v) = leer_env("AURORA_SMTP_PUERTO").filter(|s| !s.trim().is_empty()) {
+            self.smtp.puerto = v.trim().parse::<u16>().map_err(|e| {
+                DaemonError::Configuracion(format!("AURORA_SMTP_PUERTO inválido ('{v}'): {e}"))
+            })?;
+        }
+        if let Some(v) = leer_env("AURORA_SMTP_USUARIO") {
+            let limpio = v.trim().to_string();
+            self.smtp.usuario = if limpio.is_empty() { None } else { Some(limpio) };
+        }
+        if let Some(v) = leer_env("AURORA_SMTP_PASSWORD") {
+            self.smtp.password = if v.is_empty() { None } else { Some(v) };
+        }
+        if let Some(v) = leer_env("AURORA_SMTP_REMITENTE_NOMBRE").filter(|s| !s.trim().is_empty())
+        {
+            self.smtp.remitente_nombre = v.trim().to_string();
+        }
+        if let Some(v) = leer_env("AURORA_SMTP_REMITENTE_CORREO").filter(|s| !s.trim().is_empty())
+        {
+            self.smtp.remitente_correo = v.trim().to_string();
+        }
+        if let Some(v) = leer_env("AURORA_SMTP_OPT_OUT_URL").filter(|s| !s.trim().is_empty()) {
+            self.smtp.url_base_opt_out = v.trim().to_string();
+        }
+        if let Some(v) = leer_env("AURORA_SMTP_STARTTLS").filter(|s| !s.trim().is_empty()) {
+            self.smtp.usar_tls_starttls = parsear_bool_env("AURORA_SMTP_STARTTLS", &v)?;
+        }
+        if let Some(v) = leer_env("AURORA_SMTP_TLS_IMPLICITO").filter(|s| !s.trim().is_empty()) {
+            self.smtp.usar_tls_implicito = parsear_bool_env("AURORA_SMTP_TLS_IMPLICITO", &v)?;
+        }
+
+        Ok(())
+    }
+
+    fn normalizar_y_validar(&mut self) -> DaemonResult<()> {
+        if self.bind_addr.trim().is_empty() {
+            return Err(DaemonError::Configuracion(
+                "bind_addr no puede estar vacío".to_string(),
+            ));
+        }
+        let bob = self.bob_url.trim();
+        if !(bob.starts_with("http://") || bob.starts_with("https://")) {
+            return Err(DaemonError::Configuracion(format!(
+                "bob_url '{}' debe iniciar con http:// o https://",
+                self.bob_url
+            )));
+        }
+        if self.bob_slot_id != 0 {
+            return Err(DaemonError::Configuracion(format!(
+                "bob_slot_id={} viola exclusividad VRAM RTX 5060 Ti (debe ser 0)",
+                self.bob_slot_id
+            )));
+        }
+        let cdp = self.cdp_url.trim();
+        if !(cdp.starts_with("http://") || cdp.starts_with("https://")) {
+            return Err(DaemonError::Configuracion(format!(
+                "cdp_url '{}' debe iniciar con http:// o https://",
+                self.cdp_url
+            )));
+        }
+        if self.modo_offline {
+            self.modo_ejecucion = ModoEjecucion::SimuladoOffline;
+        }
+        Ok(())
+    }
+}
+
+/// Estado detallado de un subsistema de hardware/red sondeado al arranque o bajo `/health`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EstadoSubsistema {
+    /// Identificador legible del subsistema.
+    pub nombre: String,
+    /// `true` si el subsistema está listo para atender llamadas (real o simulado offline).
+    pub disponible: bool,
+    /// `true` cuando opera sobre el binario/servicio real del sistema (no mock offline).
+    pub modo_real_activo: bool,
+    /// Resumen técnico breve (versión, codec NVENC, ausencia de modelo `.onnx`, etc.).
+    pub detalle: String,
+    /// Ruta de binario en sistema o URL local sondeada.
+    pub ruta_o_endpoint: String,
+}
+
+/// Reporte consolidado de los 6 subsistemas nativos de Aurora v2 en Arch Linux.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ReporteSubsistemas {
+    /// Inferencia cognitiva local (`llama-server` slot 0 en `127.0.0.1:8085`).
+    pub bob_llm: EstadoSubsistema,
+    /// Locución neuronal en CPU (`piper` + modelo `.onnx` es_MX).
+    pub piper_tts: EstadoSubsistema,
+    /// Maquetación PDF y frames PNG en CPU headless (`chromium`/`google-chrome-stable`).
+    pub chromium_headless: EstadoSubsistema,
+    /// Ensamblaje Reel 1080x1920 (`ffmpeg` con aceleración NVENC o fallback `libx264`).
+    pub ffmpeg_nvenc: EstadoSubsistema,
+    /// Navegador Chrome DevTools Protocol WebSocket (`http://127.0.0.1:9222`) para SPAs.
+    pub cdp_browser: EstadoSubsistema,
+    /// Transporte ejecutivo SMTP (`rustls-tls` + cabecera LFPDPPP `List-Unsubscribe`).
+    pub smtp_transport: EstadoSubsistema,
+}
+
+impl ReporteSubsistemas {
+    /// Resumen compacto en una sola línea para bitácora de arranque.
+    #[must_use]
+    pub fn resumen_log(&self) -> String {
+        let mark = |st: &EstadoSubsistema| {
+            if st.modo_real_activo {
+                "REAL"
+            } else if st.disponible {
+                "MOCK"
+            } else {
+                "FALLBACK"
+            }
+        };
+        format!(
+            "bob_llm={}, piper_tts={}, chromium_headless={}, ffmpeg_nvenc={}, cdp_browser={}, smtp_transport={}",
+            mark(&self.bob_llm),
+            mark(&self.piper_tts),
+            mark(&self.chromium_headless),
+            mark(&self.ffmpeg_nvenc),
+            mark(&self.cdp_browser),
+            mark(&self.smtp_transport),
+        )
+    }
+
+    /// Devuelve todos los nombres de subsistemas críticos que no están listos en modo real.
+    #[must_use]
+    pub fn faltantes_en_modo_estricto(&self) -> Vec<String> {
+        let mut faltantes = Vec::new();
+        for st in [
+            &self.bob_llm,
+            &self.piper_tts,
+            &self.chromium_headless,
+            &self.ffmpeg_nvenc,
+        ] {
+            if !st.modo_real_activo {
+                faltantes.push(format!("{} ({})", st.nombre, st.detalle));
+            }
+        }
+        faltantes
+    }
+}
+
+/// Sonda asíncrona ligera de binarios en sistema, NVENC, CDP, SMTP y BOB HTTP `/health`.
+pub struct SubsystemProbe;
+
+impl SubsystemProbe {
+    /// Sonda todos los subsistemas relevantes respetando `config.modo_efectivo()` y timeouts cortos.
+    pub async fn ejecutar(
+        config: &AuroraDaemonConfig,
+        http_client: &Client,
+    ) -> ReporteSubsistemas {
+        let es_offline = matches!(config.modo_efectivo(), ModoEjecucion::SimuladoOffline);
+
+        let (bob_llm, cdp_browser, ffmpeg_nvenc) = tokio::join!(
+            Self::sondear_bob(config, http_client, es_offline),
+            Self::sondear_cdp(config, es_offline),
+            Self::sondear_ffmpeg(config, es_offline),
+        );
+
+        let piper_tts = Self::sondear_piper(config, es_offline);
+        let chromium_headless = Self::sondear_chromium(config, es_offline);
+        let smtp_transport = Self::sondear_smtp(config, es_offline);
+
+        ReporteSubsistemas {
+            bob_llm,
+            piper_tts,
+            chromium_headless,
+            ffmpeg_nvenc,
+            cdp_browser,
+            smtp_transport,
+        }
+    }
+
+    async fn sondear_bob(
+        config: &AuroraDaemonConfig,
+        http_client: &Client,
+        es_offline: bool,
+    ) -> EstadoSubsistema {
+        if es_offline {
+            return EstadoSubsistema {
+                nombre: "BOB Córtex (llama-server)".to_string(),
+                disponible: true,
+                modo_real_activo: false,
+                detalle: "Mock determinista offline activo (sin VRAM)".to_string(),
+                ruta_o_endpoint: config.bob_url.clone(),
+            };
+        }
+
+        let health_url = format!("{}/health", config.bob_url.trim_end_matches('/'));
+        match timeout(Duration::from_millis(450), http_client.get(&health_url).send()).await {
+            Ok(Ok(resp)) if resp.status().is_success() => EstadoSubsistema {
+                nombre: "BOB Córtex (llama-server)".to_string(),
+                disponible: true,
+                modo_real_activo: true,
+                detalle: format!("En línea en slot único VRAM id={}", config.bob_slot_id),
+                ruta_o_endpoint: health_url,
+            },
+            Ok(Ok(resp)) => EstadoSubsistema {
+                nombre: "BOB Córtex (llama-server)".to_string(),
+                disponible: false,
+                modo_real_activo: false,
+                detalle: format!("HTTP {} en /health; usando respaldo híbrido si aplica", resp.status().as_u16()),
+                ruta_o_endpoint: health_url,
+            },
+            _ => EstadoSubsistema {
+                nombre: "BOB Córtex (llama-server)".to_string(),
+                disponible: false,
+                modo_real_activo: false,
+                detalle: "Puerto 8085 sin respuesta; pendiente de llama-server".to_string(),
+                ruta_o_endpoint: health_url,
+            },
+        }
+    }
+
+    fn sondear_piper(config: &AuroraDaemonConfig, es_offline: bool) -> EstadoSubsistema {
+        let bin_cfg = expandir_tilde_path(&config.piper_bin);
+        let modelo = config.piper_model_resuelto();
+
+        if es_offline {
+            return EstadoSubsistema {
+                nombre: "Piper TTS CPU".to_string(),
+                disponible: true,
+                modo_real_activo: false,
+                detalle: "Motor WAV silencioso offline activo".to_string(),
+                ruta_o_endpoint: modelo.display().to_string(),
+            };
+        }
+
+        let bin_resuelto = resolver_binario_en_sistema(&bin_cfg, &candidatos_piper(&bin_cfg));
+        let modelo_ok = modelo.is_file();
+
+        match (bin_resuelto, modelo_ok) {
+            (Some(bin), true) => EstadoSubsistema {
+                nombre: "Piper TTS CPU".to_string(),
+                disponible: true,
+                modo_real_activo: true,
+                detalle: format!("Binario + modelo ONNX '{}' listos", modelo.display()),
+                ruta_o_endpoint: bin.display().to_string(),
+            },
+            (Some(bin), false) => EstadoSubsistema {
+                nombre: "Piper TTS CPU".to_string(),
+                disponible: false,
+                modo_real_activo: false,
+                detalle: format!(
+                    "Binario hallado ({}), falta modelo ONNX '{}'",
+                    bin.display(),
+                    modelo.display()
+                ),
+                ruta_o_endpoint: modelo.display().to_string(),
+            },
+            (None, _) => EstadoSubsistema {
+                nombre: "Piper TTS CPU".to_string(),
+                disponible: false,
+                modo_real_activo: false,
+                detalle: "Binario piper no localizado en PATH ni ~/.local/bin (respaldo WAV limpio)"
+                    .to_string(),
+                ruta_o_endpoint: bin_cfg.display().to_string(),
+            },
+        }
+    }
+
+    fn sondear_chromium(config: &AuroraDaemonConfig, es_offline: bool) -> EstadoSubsistema {
+        let bin_cfg = expandir_tilde_path(&config.chromium_bin);
+
+        if es_offline {
+            return EstadoSubsistema {
+                nombre: "Chromium Headless CPU".to_string(),
+                disponible: true,
+                modo_real_activo: false,
+                detalle: "Motor PDF/PNG mock determinista activo".to_string(),
+                ruta_o_endpoint: bin_cfg.display().to_string(),
+            };
+        }
+
+        if let Some(bin) = resolver_binario_en_sistema(&bin_cfg, &candidatos_chromium(&bin_cfg)) {
+            EstadoSubsistema {
+                nombre: "Chromium Headless CPU".to_string(),
+                disponible: true,
+                modo_real_activo: true,
+                detalle: "Navegador headless CPU listo (--headless=new --disable-gpu)".to_string(),
+                ruta_o_endpoint: bin.display().to_string(),
+            }
+        } else {
+            EstadoSubsistema {
+                nombre: "Chromium Headless CPU".to_string(),
+                disponible: false,
+                modo_real_activo: false,
+                detalle: "No se halló chromium ni google-chrome-stable en PATH".to_string(),
+                ruta_o_endpoint: bin_cfg.display().to_string(),
+            }
+        }
+    }
+
+    async fn sondear_ffmpeg(config: &AuroraDaemonConfig, es_offline: bool) -> EstadoSubsistema {
+        let bin_cfg = expandir_tilde_path(&config.ffmpeg_bin);
+
+        if es_offline {
+            return EstadoSubsistema {
+                nombre: "FFmpeg + NVENC".to_string(),
+                disponible: true,
+                modo_real_activo: false,
+                detalle: "Compositor MP4 determinista offline activo".to_string(),
+                ruta_o_endpoint: bin_cfg.display().to_string(),
+            };
+        }
+
+        let Some(bin) = resolver_binario_en_sistema(&bin_cfg, &[]) else {
+            return EstadoSubsistema {
+                nombre: "FFmpeg + NVENC".to_string(),
+                disponible: false,
+                modo_real_activo: false,
+                detalle: "Binario ffmpeg no encontrado en PATH".to_string(),
+                ruta_o_endpoint: bin_cfg.display().to_string(),
+            };
+        };
+
+        let mut detalle = "FFmpeg disponible (CPU libx264)".to_string();
+        if config.usar_nvenc {
+            if let Ok(Ok(output)) = timeout(
+                Duration::from_millis(1_200),
+                Command::new(&bin)
+                    .args(["-hide_banner", "-encoders"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .output(),
+            )
+            .await
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if stdout.contains("h264_nvenc") {
+                    detalle = "FFmpeg + codec hardware h264_nvenc listo".to_string();
+                } else {
+                    detalle = "FFmpeg listo; h264_nvenc ausente (usará fallback libx264)".to_string();
+                }
+            }
+        }
+
+        EstadoSubsistema {
+            nombre: "FFmpeg + NVENC".to_string(),
+            disponible: true,
+            modo_real_activo: true,
+            detalle,
+            ruta_o_endpoint: bin.display().to_string(),
+        }
+    }
+
+    async fn sondear_cdp(config: &AuroraDaemonConfig, es_offline: bool) -> EstadoSubsistema {
+        if es_offline {
+            return EstadoSubsistema {
+                nombre: "Browser CDP (:9222)".to_string(),
+                disponible: false,
+                modo_real_activo: false,
+                detalle: "Desactivado en simulado_offline".to_string(),
+                ruta_o_endpoint: config.cdp_url.clone(),
+            };
+        }
+
+        let cfg = ConfigCdpFetcher {
+            cdp_http_url: config.cdp_url.clone(),
+            timeout_ms: 800,
+            esperar_hidratacion_ms: 300,
+        };
+        let online = match HttpCdpBrowserFetcher::new(cfg) {
+            Ok(fetcher) => fetcher.probe_disponible().await,
+            Err(_) => false,
+        };
+
+        EstadoSubsistema {
+            nombre: "Browser CDP (:9222)".to_string(),
+            disponible: online,
+            modo_real_activo: online,
+            detalle: if online {
+                "Chrome DevTools WebSocket activo para SPAs dinámicas".to_string()
+            } else {
+                "Endpoint CDP inactivo (cacerías JS usarán HTML directo / fallback)".to_string()
+            },
+            ruta_o_endpoint: config.cdp_url.clone(),
+        }
+    }
+
+    fn sondear_smtp(config: &AuroraDaemonConfig, es_offline: bool) -> EstadoSubsistema {
+        if es_offline {
+            return EstadoSubsistema {
+                nombre: "SMTP TLS (rustls)".to_string(),
+                disponible: true,
+                modo_real_activo: false,
+                detalle: "Despacho simulado offline activo".to_string(),
+                ruta_o_endpoint: format!("{}:{}", config.smtp.host, config.smtp.puerto),
+            };
+        }
+
+        let endpoint = format!("{}:{}", config.smtp.host, config.smtp.puerto);
+        if !config.smtp.habilitado {
+            return EstadoSubsistema {
+                nombre: "SMTP TLS (rustls)".to_string(),
+                disponible: false,
+                modo_real_activo: false,
+                detalle: "smtp.habilitado = false (correo ejecutivo usará simulación segura)"
+                    .to_string(),
+                ruta_o_endpoint: endpoint,
+            };
+        }
+
+        let config_valida = !config.smtp.host.trim().is_empty()
+            && config.smtp.puerto > 0
+            && config.smtp.remitente_correo.contains('@')
+            && (config.smtp.url_base_opt_out.starts_with("http://")
+                || config.smtp.url_base_opt_out.starts_with("https://"));
+
+        EstadoSubsistema {
+            nombre: "SMTP TLS (rustls)".to_string(),
+            disponible: config_valida,
+            modo_real_activo: config_valida,
+            detalle: if config_valida {
+                let tls = if config.smtp.usar_tls_implicito {
+                    "TLS implícito"
+                } else if config.smtp.usar_tls_starttls {
+                    "STARTTLS rustls"
+                } else {
+                    "SMTP plano local"
+                };
+                format!("Habilitado ({tls}) con cabecera List-Unsubscribe")
+            } else {
+                "Configuración SMTP incompleta (revisa host, puerto, remitente y url_base_opt_out)"
+                    .to_string()
+            },
+            ruta_o_endpoint: endpoint,
+        }
+    }
+}
+
+fn directorio_datos_xdg_por_defecto() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        let trimmed = xdg.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("aurora");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join(".local/share/aurora");
+        }
+    }
+    PathBuf::from("data/aurora_daemon")
+}
+
+fn directorio_config_xdg_por_defecto() -> PathBuf {
+    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+        let trimmed = xdg.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("aurora");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let trimmed = home.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join(".config/aurora");
+        }
+    }
+    PathBuf::from("config/aurora")
+}
+
+/// Expande un prefijo `~/` o `~` hacia `$HOME` si existe en el entorno.
+#[must_use]
+pub fn expandir_tilde_path(ruta: &Path) -> PathBuf {
+    let raw = ruta.to_string_lossy();
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    } else if raw == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    ruta.to_path_buf()
+}
+
+fn candidatos_chromium(cfg: &Path) -> Vec<&'static str> {
+    let es_generico = cfg
+        .to_str()
+        .is_some_and(|s| s == "chromium" || s == "chromium-browser");
+    if es_generico {
+        vec![
+            "chromium",
+            "google-chrome-stable",
+            "chromium-browser",
+            "google-chrome",
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+fn candidatos_piper(cfg: &Path) -> Vec<&'static str> {
+    let es_generico = cfg.to_str().is_some_and(|s| s == "piper" || s == "piper-tts");
+    if es_generico {
+        vec!["piper", "piper-tts"]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Busca un binario en ruta explícita, en `$PATH` o entre candidatos alternativos de Arch Linux.
+#[must_use]
+pub fn resolver_binario_en_sistema(configurado: &Path, candidatos_fallback: &[&str]) -> Option<PathBuf> {
+    let texto = configurado.to_string_lossy();
+    if texto.contains('/') {
+        return es_ejecutable(configurado).then(|| configurado.to_path_buf());
+    }
+
+    if let Some(encontrado) = buscar_en_path(configurado) {
+        return Some(encontrado);
+    }
+
+    for candidato in candidatos_fallback {
+        if let Some(encontrado) = buscar_en_path(Path::new(candidato)) {
+            return Some(encontrado);
+        }
+    }
+
+    // Rutas comunes en Arch Linux para instalaciones manuales de Piper.
+    if candidatos_fallback.contains(&"piper") {
+        if let Ok(home) = std::env::var("HOME") {
+            let local_piper = PathBuf::from(home).join(".local/bin/piper");
+            if es_ejecutable(&local_piper) {
+                return Some(local_piper);
+            }
+        }
+        let opt_piper = PathBuf::from("/opt/piper/piper");
+        if es_ejecutable(&opt_piper) {
+            return Some(opt_piper);
+        }
+    }
+
+    None
+}
+
+fn buscar_en_path(binario: &Path) -> Option<PathBuf> {
+    let path_env = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_env) {
+        let candidato = dir.join(binario);
+        if es_ejecutable(&candidato) {
+            return Some(candidato);
+        }
+    }
+    None
+}
+
+fn es_ejecutable(ruta: &Path) -> bool {
+    let Ok(meta) = fs::metadata(ruta) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn parsear_bool_env(clave: &str, raw: &str) -> DaemonResult<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "si" | "sí" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(DaemonError::Configuracion(format!(
+            "valor booleano inválido para {clave}: '{raw}'"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn config_carga_toml_y_aplica_overrides_de_entorno() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = std::env::temp_dir().join(format!("aurora_cfg_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&tmp)?;
+        let toml_path = tmp.join("aurora.toml");
+        fs::write(
+            &toml_path,
+            r#"
+bind_addr = "127.0.0.1:8095"
+bob_url = "http://127.0.0.1:8085"
+bob_slot_id = 0
+data_dir = "~/.local/share/aurora"
+modo_ejecucion = "real_con_fallback"
+usar_nvenc = true
+
+[smtp]
+habilitado = true
+host = "smtp.resend.com"
+puerto = 587
+remitente_correo = "comercial@inmobiliaria-aurora.mx"
+"#,
+        )?;
+
+        let mut env_map = HashMap::new();
+        env_map.insert("AURORA_BIND_ADDR", "127.0.0.1:8199".to_string());
+        env_map.insert("AURORA_SMTP_PUERTO", "465".to_string());
+        env_map.insert("AURORA_SMTP_TLS_IMPLICITO", "true".to_string());
+
+        let cfg = AuroraDaemonConfig::cargar_con_lector_entorno(Some(&toml_path), |k| {
+            env_map.get(k).cloned()
+        })?;
+
+        assert_eq!(cfg.bind_addr, "127.0.0.1:8199");
+        assert_eq!(cfg.bob_slot_id, 0);
+        assert_eq!(cfg.modo_ejecucion, ModoEjecucion::RealConFallback);
+        assert!(cfg.smtp.habilitado);
+        assert_eq!(cfg.smtp.host, "smtp.resend.com");
+        assert_eq!(cfg.smtp.puerto, 465);
+        assert!(cfg.smtp.usar_tls_implicito);
+        assert!(cfg.wal_dir_efectivo().ends_with("aurora/wal"));
+        assert!(cfg.artefactos_dir_efectivo().ends_with("aurora/artefactos"));
+        assert!(cfg.dpo_dir_efectivo().ends_with("aurora/dpo"));
+
+        let _ = fs::remove_dir_all(&tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn config_rechaza_slot_distinto_de_cero_y_offline_legacy_fuerza_modo() -> Result<(), Box<dyn std::error::Error>> {
+        let env_slot = HashMap::from([("AURORA_BOB_SLOT_ID", "1".to_string())]);
+        let err = AuroraDaemonConfig::cargar_con_lector_entorno(None, |k| env_slot.get(k).cloned());
+        assert!(err.is_err());
+
+        let env_off = HashMap::from([("AURORA_OFFLINE_MOCK", "1".to_string())]);
+        let cfg = AuroraDaemonConfig::cargar_con_lector_entorno(None, |k| env_off.get(k).cloned())?;
+        assert_eq!(cfg.modo_efectivo(), ModoEjecucion::SimuladoOffline);
+        Ok(())
+    }
+}

@@ -1,9 +1,9 @@
-use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use aurora_daemon::{crear_router, AuroraDaemonState, DaemonConfig};
+use aurora_daemon::{crear_router, AuroraDaemonConfig, AuroraDaemonState, ModoEjecucion};
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -12,31 +12,15 @@ async fn main() -> ExitCode {
         .unwrap_or_else(|_| EnvFilter::new("aurora_daemon=info,aurora_pulse=info,tower_http=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let bind_addr =
-        std::env::var("AURORA_BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8090".to_string());
-    let bob_url = std::env::var("AURORA_BOB_URL")
-        .unwrap_or_else(|_| aurora_cortex::DEFAULT_BOB_URL.to_string());
-    let bob_slot_id = std::env::var("AURORA_BOB_SLOT_ID")
-        .ok()
-        .and_then(|v| v.parse::<i32>().ok())
-        .unwrap_or(0);
-    let data_dir = std::env::var("AURORA_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("data/aurora_daemon"));
-    let modo_offline = matches!(
-        std::env::var("AURORA_OFFLINE_MOCK").ok().as_deref(),
-        Some("1" | "true" | "TRUE")
-    );
-
-    let config = DaemonConfig {
-        bind_addr: bind_addr.clone(),
-        bob_url: bob_url.clone(),
-        bob_slot_id,
-        data_dir,
-        modo_offline,
+    let config = match AuroraDaemonConfig::cargar_desde_toml_y_entorno() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            error!(error = %err, "Error cargando configuración de aurora-daemon");
+            return ExitCode::FAILURE;
+        }
     };
 
-    let state = match AuroraDaemonState::inicializar_local(config) {
+    let state = match AuroraDaemonState::inicializar_local(config.clone()) {
         Ok(s) => s,
         Err(err) => {
             error!(error = %err, "Fallo inicializando estado de aurora-daemon");
@@ -44,32 +28,65 @@ async fn main() -> ExitCode {
         }
     };
 
-    let listener = match TcpListener::bind(&bind_addr).await {
+    let subsistemas = state.sondear_subsistemas().await;
+    info!(
+        modo_ejecucion = config.modo_efectivo().etiqueta(),
+        data_dir = %config.data_dir_resuelto().display(),
+        subsistemas = %subsistemas.resumen_log(),
+        "Sondeo inicial de subsistemas completado"
+    );
+
+    if matches!(config.modo_efectivo(), ModoEjecucion::EstrictoReal) {
+        let faltantes = subsistemas.faltantes_en_modo_estricto();
+        if !faltantes.is_empty() {
+            error!(
+                faltantes = ?faltantes,
+                "Modo estricto_real activo y faltan subsistemas críticos; abortando arranque"
+            );
+            return ExitCode::FAILURE;
+        }
+    } else if !subsistemas.bob_llm.modo_real_activo {
+        warn!(
+            bob_url = %config.bob_url,
+            "BOB llama-server no detectado al arranque; operando con respaldo híbrido RealConFallback hasta que suba :8085"
+        );
+    }
+
+    let listener = match TcpListener::bind(&config.bind_addr).await {
         Ok(l) => l,
         Err(err) => {
-            error!(bind_addr = %bind_addr, error = %err, "No se pudo enlazar puerto local");
+            error!(bind_addr = %config.bind_addr, error = %err, "No se pudo enlazar puerto local");
             return ExitCode::FAILURE;
         }
     };
 
     info!(
-        bind_addr = %bind_addr,
-        bob_url = %bob_url,
-        bob_slot_id,
-        modo_offline,
+        bind_addr = %config.bind_addr,
+        bob_url = %config.bob_url,
+        bob_slot_id = config.bob_slot_id,
+        modo_ejecucion = config.modo_efectivo().etiqueta(),
         "aurora-daemon escuchando para Cockpit axis_v1 y automatizaciones locales"
     );
 
+    let state_shutdown = Arc::clone(&state);
     let router = crear_router(state);
     if let Err(err) = axum::serve(listener, router)
         .with_graceful_shutdown(esperar_senal_apagado())
         .await
     {
         error!(error = %err, "Error ejecutando servidor HTTP axum");
+        if let Err(shutdown_err) = state_shutdown.apagar_ordenadamente().await {
+            error!(error = %shutdown_err, "Error compactando WAL tras fallo de servidor");
+        }
         return ExitCode::FAILURE;
     }
 
-    info!("aurora-daemon apagado limpiamente");
+    if let Err(err) = state_shutdown.apagar_ordenadamente().await {
+        error!(error = %err, "Error durante apagado ordenado (flush/compactación WAL)");
+        return ExitCode::FAILURE;
+    }
+
+    info!("aurora-daemon apagado limpiamente con WAL 4D y cola Gatekeeper persistidos");
     ExitCode::SUCCESS
 }
 

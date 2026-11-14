@@ -16,6 +16,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
+use crate::config::ReporteSubsistemas;
 use crate::error::{DaemonError, DaemonResult};
 use crate::state::{
     AprobarOrdenRequest, AprobarOrdenResponse, AuroraDaemonState, DpoConsolidarResponse,
@@ -29,6 +30,7 @@ use aurora_memory::SubgrafoProspecto;
 pub fn crear_router(state: Arc<AuroraDaemonState>) -> Router {
     Router::new()
         .route("/api/v1/health", get(handler_health))
+        .route("/api/v1/health/subsistemas", get(handler_subsistemas))
         .route("/api/v1/osint/hunt", post(handler_hunt))
         .route("/api/v1/memory/telarana", get(handler_telarana))
         .route(
@@ -60,6 +62,12 @@ pub fn crear_router(state: Arc<AuroraDaemonState>) -> Router {
 
 async fn handler_health(State(state): State<Arc<AuroraDaemonState>>) -> Json<HealthResponse> {
     Json(state.health().await)
+}
+
+async fn handler_subsistemas(
+    State(state): State<Arc<AuroraDaemonState>>,
+) -> Json<ReporteSubsistemas> {
+    Json(state.sondear_subsistemas().await)
 }
 
 async fn handler_hunt(

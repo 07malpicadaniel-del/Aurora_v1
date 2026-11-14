@@ -8,7 +8,7 @@ Contexto operativo y reglas de ingeniería obligatorias para cualquier agente o 
 
 ## 2. Ecosistema Local y Repositorios Hermanos
 
-- **Entorno anfitrión:** Arch Linux (Wayland / Hyprland) sobre AMD Ryzen 9, **64 GB RAM** y **NVIDIA RTX 5060 Ti (16 GB VRAM)**.
+- **Entorno anfitrión:** Arch Linux (Wayland / Hyprland / Niri) sobre AMD Ryzen 9, **64 GB RAM** y **NVIDIA RTX 5060 Ti (16 GB VRAM)**.
 - **Repositorio actual (`Aurora_v1`):** `https://github.com/07malpicadaniel-del/Aurora_v1.git`
 - **Motor cognitivo y memoria (`../bob_betta`):** `https://github.com/07malpicadaniel-del/bob_betta.git`
   - `cortex`: Cliente/gestor de inferencia local (`llama.cpp` server en `127.0.0.1:8085`).
@@ -41,7 +41,7 @@ Para evitar saturación térmica y errores OOM en sesiones autónomas largas:
 | `aurora-cortex` | `crates/aurora-cortex` | **Completa (Fase 3)** | Córtex comercial de BOB (`Perfilador`, `DirectorCreativo`, `Auditor`), gramáticas GBNF estrictas y `ToolDispatcher` bajo Gatekeeper. |
 | `aurora-factory` | `crates/aurora-factory` | **Completa (Fase 4)** | Fábrica multimodal local (`DossierPdf`, `NotaVozTts` CPU/RAM, `ReelVerticalMp4` FFmpeg/NVENC con fallback `libx264` y barrera Gatekeeper Zero-Bypass). |
 | `aurora-pulse` | `crates/aurora-pulse` | **Completa (Fase 5)** | Calentamiento periférico 24–72 h, rate-limiting/circuit breakers, despachador multicanal SHA-256 bajo Gatekeeper Zero-Bypass, telemetría con purga LFPDPPP inmediata y ciclo nocturno DPO en JSONL. |
-| `aurora-daemon` | `crates/aurora-daemon` | **Completa (Fase 6)** | Demonio HTTP/WebSocket/SSE local (`axum` + `tokio` en `127.0.0.1:8090` / `AURORA_BIND_ADDR`), colas Gatekeeper, cacería OSINT, telaraña 4D, pulso multicanal, consolidación DPO y purga física LFPDPPP para consumo desde `axis_v1`. |
+| `aurora-daemon` | `crates/aurora-daemon` | **Completa (Fases 6–7)** | Demonio HTTP/WebSocket/SSE local (`axum` + `tokio` en `127.0.0.1:8090` / `AURORA_BIND_ADDR`), configuración TOML/`AURORA_*`, sonda `SubsystemProbe` (BOB `:8085`, Piper TTS CPU, Chromium/Chrome Headless, FFmpeg NVENC, CDP `:9222`, SMTP `rustls` con `List-Unsubscribe`), adaptadores híbridos (`real_con_fallback`/`estricto_real`/`simulado_offline`), compactación WAL en apagado ordenado (`SIGTERM`/`Ctrl+C`) y unidad `systemd --user` en `deploy/`. |
 
 ## 5. Reglas de Calidad Inquebrantables
 

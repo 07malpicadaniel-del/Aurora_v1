@@ -28,9 +28,9 @@ use aurora_memory::{
     VecinoCirculoCercano,
 };
 use aurora_osint::{
-    ConsultaObjetivo, DestiladorOsint, EnjambreOsint, EntityResolver, FormatoCrudo,
-    HttpSwarmClient, OsintResult, OsintSource, PipelineOsint, PoliticaHttp, RegistroCrudo,
-    SenalesAbiertasAdapter,
+    ConfigCdpFetcher, ConsultaObjetivo, DestiladorOsint, DynamicBrowserFetcher, EnjambreOsint,
+    EntityResolver, FormatoCrudo, HttpCdpBrowserFetcher, HttpSwarmClient, OsintError, OsintResult,
+    OsintSource, PipelineOsint, PoliticaHttp, RegistroCrudo, SenalesAbiertasAdapter,
 };
 use aurora_pulse::{
     ChannelTransport, ComprobanteDespacho, ConfigCalentamiento, ConfigConsolidacionNocturna,
@@ -38,7 +38,7 @@ use aurora_pulse::{
     DeterministicMockTransport, DeterministicMockWarmupDriver, EstadoTasaPlataforma,
     EventoTelemetria, GestorCalentamientoPeriferico, MotorConsolidacionNocturna, PlataformaPulso,
     PulseResult, RecolectorTelemetria, RegistroInteraccion, ResumenGanchoTelemetria,
-    SocialWarmupDriver, TipoEventoTelemetria,
+    SmtpEmailTransport, SocialWarmupDriver, TipoEventoTelemetria,
 };
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
@@ -48,6 +48,14 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::adapters::{
+    HybridBobBackend, HybridChannelTransport, HybridDocumentEngine, HybridTtsEngine,
+    HybridVideoComposer,
+};
+use crate::config::{
+    resolver_binario_en_sistema, AuroraDaemonConfig, ModoEjecucion, ReporteSubsistemas,
+    SubsystemProbe,
+};
 use crate::error::{DaemonError, DaemonResult};
 
 /// Envoltorio object-safe para conectar cualquier [`BobInferenceBackend`] con el daemon sin genéricos en router.
@@ -177,32 +185,8 @@ impl OsintSource for InlineOsintSource {
     }
 }
 
-/// Configuración principal del demonio HTTP local `aurora-daemon`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DaemonConfig {
-    /// Dirección IP y puerto de escucha (`127.0.0.1:8090` por defecto).
-    pub bind_addr: String,
-    /// Endpoint local de BOB `llama-server` (`http://127.0.0.1:8085` por defecto).
-    pub bob_url: String,
-    /// Ranura única asignada a Aurora en la GPU RTX 5060 Ti.
-    pub bob_slot_id: i32,
-    /// Directorio raíz en NVMe para WAL, artefactos multimedia, DPO y cola Gatekeeper.
-    pub data_dir: PathBuf,
-    /// Indica si se operan backends deterministas offline (CI/pruebas).
-    pub modo_offline: bool,
-}
-
-impl Default for DaemonConfig {
-    fn default() -> Self {
-        Self {
-            bind_addr: "127.0.0.1:8090".to_string(),
-            bob_url: aurora_cortex::DEFAULT_BOB_URL.to_string(),
-            bob_slot_id: 0,
-            data_dir: PathBuf::from("data/aurora_daemon"),
-            modo_offline: false,
-        }
-    }
-}
+/// Alias compatible hacia [`AuroraDaemonConfig`].
+pub type DaemonConfig = AuroraDaemonConfig;
 
 /// Respuesta de salud y telemetría de hardware para `GET /api/v1/health`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +199,9 @@ pub struct HealthResponse {
     pub bind_addr: String,
     /// Indica si corre con adaptadores deterministas offline o motores locales reales.
     pub modo_offline: bool,
+    /// Política activa de ejecución (`real_con_fallback`, `estricto_real` o `simulado_offline`).
+    #[serde(default)]
+    pub modo_ejecucion: ModoEjecucion,
     /// URL configurada de BOB (`127.0.0.1:8085`).
     pub bob_url: String,
     /// Disponibilidad actual de BOB (`true` si responde `/health` o en modo offline mock).
@@ -225,6 +212,9 @@ pub struct HealthResponse {
     pub hardware_vram_modelo: String,
     /// Descripción del presupuesto CPU/RAM.
     pub hardware_ram_sistema: String,
+    /// Diagnóstico en vivo de cada subsistema nativo y puente HTTP/SMTP.
+    #[serde(default)]
+    pub subsistemas: ReporteSubsistemas,
     /// Total de prospectos activos en el hipergrafo 4D.
     pub nodos_4d: usize,
     /// Total de relaciones topológicas del Círculo Cercano.
@@ -426,6 +416,9 @@ pub struct GatekeeperPendientesResponse {
 pub struct AprobarOrdenRequest {
     /// Si es `true`, tras aprobar y calentar ejecuta despacho inmediato autorizado por operador.
     pub despachar_inmediatamente: Option<bool>,
+    /// Correo destino explícito cuando el prospecto aún no lo tiene en alias OSINT.
+    #[serde(default)]
+    pub correo_destino: Option<String>,
 }
 
 /// Respuesta devuelta por `POST /api/v1/gatekeeper/aprobar/:orden_id`.
@@ -553,9 +546,10 @@ impl RegistroOrdenInterno {
 
 /// Estado central compartido y thread-safe de `aurora-daemon`.
 pub struct AuroraDaemonState {
-    config: DaemonConfig,
+    config: AuroraDaemonConfig,
     started_at: DateTime<Utc>,
     http_probe: Client,
+    cdp_fetcher: Option<Arc<HttpCdpBrowserFetcher>>,
     memoria: RwLock<MotorMemoriaAurora>,
     osint_fuentes: RwLock<Vec<Arc<dyn OsintSource>>>,
     orquestador: OrquestadorComercialBob<DynBobBackend>,
@@ -573,63 +567,123 @@ pub struct AuroraDaemonState {
 }
 
 impl AuroraDaemonState {
-    /// Construye el estado de producción local sobre `data_dir` en NVMe, BOB (`127.0.0.1:8085`),
-    /// `PiperCpuTtsEngine`, `HeadlessBrowserDocumentEngine`, `FfmpegNvencComposer` y fallback limpio.
-    pub fn inicializar_local(config: DaemonConfig) -> DaemonResult<Arc<Self>> {
-        let wal_dir = config.data_dir.join("memory_wal");
-        let factory_dir = config.data_dir.join("factory_assets");
-        let dpo_dir = config.data_dir.join("dpo_datasets");
-        let queue_path = config.data_dir.join("gatekeeper_queue.json");
+    /// Construye el estado de producción local sobre `data_dir` XDG/NVMe, BOB (`127.0.0.1:8085`),
+    /// `PiperCpuTtsEngine`, `HeadlessBrowserDocumentEngine`, `FfmpegNvencComposer`, CDP y SMTP rustls.
+    pub fn inicializar_local(config: AuroraDaemonConfig) -> DaemonResult<Arc<Self>> {
+        let data_dir = config.data_dir_resuelto();
+        let wal_dir = config.wal_dir_efectivo();
+        let factory_dir = config.artefactos_dir_efectivo();
+        let dpo_dir = config.dpo_dir_efectivo();
+        let queue_path = config.queue_path_efectivo();
 
-        fs::create_dir_all(&config.data_dir).map_err(|e| {
-            DaemonError::Interno(format!(
-                "no fue posible crear directorio de datos '{}': {e}",
-                config.data_dir.display()
-            ))
-        })?;
+        for dir in [&data_dir, &factory_dir, &dpo_dir] {
+            fs::create_dir_all(dir).map_err(|e| {
+                DaemonError::Interno(format!(
+                    "no fue posible crear directorio de datos '{}': {e}",
+                    dir.display()
+                ))
+            })?;
+        }
 
-        let embedder: Arc<dyn TextEmbedder> = if let Ok(cpu_embedder) =
-            MultilingualCpuEmbedder::new(ConfigEmbedderMultilingue::default())
-        {
-            Arc::new(cpu_embedder)
-        } else {
-            warn!("No se pudo inicializar MultilingualCpuEmbedder; usando DeterministicSimdEmbedder como respaldo");
-            Arc::new(DeterministicSimdEmbedder::default())
+        let modo = config.modo_efectivo();
+        let embedder: Arc<dyn TextEmbedder> = match modo {
+            ModoEjecucion::SimuladoOffline => Arc::new(DeterministicSimdEmbedder::default()),
+            ModoEjecucion::EstrictoReal => Arc::new(MultilingualCpuEmbedder::new(
+                ConfigEmbedderMultilingue::default(),
+            )?),
+            ModoEjecucion::RealConFallback => {
+                if let Ok(cpu_embedder) =
+                    MultilingualCpuEmbedder::new(ConfigEmbedderMultilingue::default())
+                {
+                    Arc::new(cpu_embedder)
+                } else {
+                    warn!("No se pudo inicializar MultilingualCpuEmbedder; usando DeterministicSimdEmbedder como respaldo");
+                    Arc::new(DeterministicSimdEmbedder::default())
+                }
+            }
         };
 
         let memoria = MotorMemoriaAurora::abrir(&wal_dir, embedder, ConfigDecaimiento4D::default())?;
 
-        let bob_backend: Arc<dyn BobInferenceBackend> = if config.modo_offline {
-            Arc::new(DeterministicMockBob)
-        } else {
-            let mut bob_cfg = ConfigHttpBob::default();
-            bob_cfg.url_base.clone_from(&config.bob_url);
-            bob_cfg.slot_id = config.bob_slot_id;
-            Arc::new(HttpBobCortexClient::new(bob_cfg)?)
+        let bob_cfg = ConfigHttpBob {
+            url_base: config.bob_url.clone(),
+            slot_id: config.bob_slot_id,
+            ..ConfigHttpBob::default()
         };
+        let bob_backend: Arc<dyn BobInferenceBackend> = Arc::new(HybridBobBackend {
+            real: HttpBobCortexClient::new(bob_cfg)?,
+            fallback: DeterministicMockBob,
+            modo,
+        });
 
-        let tts_engine: Arc<dyn TtsEngine> = if config.modo_offline {
-            Arc::new(DeterministicSilentWavEngine)
-        } else {
-            Arc::new(PiperCpuTtsEngine::new(ConfigPiperCpu::default()))
+        let piper_bin = config.piper_bin_efectivo();
+        let piper_model = config.piper_model_resuelto();
+        let piper_precheck =
+            resolver_binario_en_sistema(&piper_bin, &[]).is_some() && piper_model.is_file();
+        let piper_cfg = ConfigPiperCpu {
+            binario_piper: piper_bin,
+            modelo_onnx: piper_model,
+            speaker_id: config.piper_speaker_id,
+            ..ConfigPiperCpu::default()
         };
+        let tts_engine: Arc<dyn TtsEngine> = Arc::new(HybridTtsEngine {
+            real: PiperCpuTtsEngine::new(piper_cfg),
+            fallback: DeterministicSilentWavEngine,
+            modo,
+            precheck_listo: piper_precheck,
+        });
 
-        let doc_engine: Arc<dyn DocumentEngine> = if config.modo_offline {
-            Arc::new(DeterministicMockDocumentEngine)
-        } else {
-            Arc::new(HeadlessBrowserDocumentEngine::new(
-                ConfigHeadlessBrowser::default(),
-            ))
+        let chromium_bin = config.chromium_bin_efectivo();
+        let chromium_disponible = resolver_binario_en_sistema(&chromium_bin, &[]).is_some();
+        let chromium_cfg = ConfigHeadlessBrowser {
+            binario_navegador: chromium_bin,
+            ..ConfigHeadlessBrowser::default()
         };
+        let doc_engine: Arc<dyn DocumentEngine> = Arc::new(HybridDocumentEngine {
+            real: HeadlessBrowserDocumentEngine::new(chromium_cfg),
+            fallback: DeterministicMockDocumentEngine,
+            modo,
+            binario_disponible: chromium_disponible,
+        });
 
-        let video_composer: Arc<dyn VideoComposer> = if config.modo_offline {
-            Arc::new(DeterministicMockVideoComposer)
+        let ffmpeg_bin = config.ffmpeg_bin_efectivo();
+        let ffmpeg_disponible = resolver_binario_en_sistema(&ffmpeg_bin, &[]).is_some();
+        let ffmpeg_cfg = ConfigFfmpeg {
+            binario_ffmpeg: ffmpeg_bin,
+            usar_nvenc: config.usar_nvenc,
+            ..ConfigFfmpeg::default()
+        };
+        let video_composer: Arc<dyn VideoComposer> = Arc::new(HybridVideoComposer {
+            real: FfmpegNvencComposer::new(ffmpeg_cfg),
+            fallback: DeterministicMockVideoComposer,
+            modo,
+            binario_disponible: ffmpeg_disponible,
+        });
+
+        let smtp_client = if config.smtp.habilitado && !matches!(modo, ModoEjecucion::SimuladoOffline)
+        {
+            Some(Arc::new(SmtpEmailTransport::new(config.smtp.clone())?))
         } else {
-            Arc::new(FfmpegNvencComposer::new(ConfigFfmpeg::default()))
+            None
         };
 
         let warmup_driver: Arc<dyn SocialWarmupDriver> = Arc::new(DeterministicMockWarmupDriver::new());
-        let transport: Arc<dyn ChannelTransport> = Arc::new(DeterministicMockTransport::new());
+        let transport: Arc<dyn ChannelTransport> = Arc::new(HybridChannelTransport {
+            smtp: smtp_client,
+            smtp_config: config.smtp.clone(),
+            fallback: DeterministicMockTransport::new(),
+            modo,
+        });
+
+        let cdp_fetcher = if matches!(modo, ModoEjecucion::SimuladoOffline) {
+            None
+        } else {
+            let cfg_cdp = ConfigCdpFetcher {
+                cdp_http_url: config.cdp_url.clone(),
+                ..ConfigCdpFetcher::default()
+            };
+            Some(Arc::new(HttpCdpBrowserFetcher::new(cfg_cdp)?))
+        };
 
         Self::con_componentes(
             config,
@@ -641,6 +695,7 @@ impl AuroraDaemonState {
             video_composer,
             warmup_driver,
             transport,
+            cdp_fetcher,
             factory_dir,
             dpo_dir,
             Some(queue_path),
@@ -649,17 +704,18 @@ impl AuroraDaemonState {
 
     /// Construye un estado determinista completamente offline ideal para pruebas de integración HTTP.
     pub fn para_pruebas_offline(base_dir: &Path) -> DaemonResult<Arc<Self>> {
-        let config = DaemonConfig {
+        let config = AuroraDaemonConfig {
             bind_addr: "127.0.0.1:0".to_string(),
             data_dir: base_dir.to_path_buf(),
             modo_offline: true,
-            ..DaemonConfig::default()
+            modo_ejecucion: ModoEjecucion::SimuladoOffline,
+            ..AuroraDaemonConfig::default()
         };
 
-        let wal_dir = base_dir.join("wal");
-        let factory_dir = base_dir.join("factory");
-        let dpo_dir = base_dir.join("dpo");
-        let queue_path = base_dir.join("gatekeeper_queue.json");
+        let wal_dir = config.wal_dir_efectivo();
+        let factory_dir = config.artefactos_dir_efectivo();
+        let dpo_dir = config.dpo_dir_efectivo();
+        let queue_path = config.queue_path_efectivo();
 
         fs::create_dir_all(base_dir).map_err(|e| {
             DaemonError::Interno(format!(
@@ -681,6 +737,7 @@ impl AuroraDaemonState {
             Arc::new(DeterministicMockVideoComposer),
             Arc::new(DeterministicMockWarmupDriver::new()),
             Arc::new(DeterministicMockTransport::new()),
+            None,
             factory_dir,
             dpo_dir,
             Some(queue_path),
@@ -689,7 +746,7 @@ impl AuroraDaemonState {
 
     #[allow(clippy::too_many_arguments)]
     fn con_componentes(
-        config: DaemonConfig,
+        config: AuroraDaemonConfig,
         memoria: MotorMemoriaAurora,
         fuentes_iniciales: Vec<Arc<dyn OsintSource>>,
         bob_backend: Arc<dyn BobInferenceBackend>,
@@ -698,6 +755,7 @@ impl AuroraDaemonState {
         video_composer: Arc<dyn VideoComposer>,
         warmup_driver: Arc<dyn SocialWarmupDriver>,
         transport: Arc<dyn ChannelTransport>,
+        cdp_fetcher: Option<Arc<HttpCdpBrowserFetcher>>,
         factory_dir: PathBuf,
         dpo_dir: PathBuf,
         ruta_cola_persistida: Option<PathBuf>,
@@ -746,6 +804,7 @@ impl AuroraDaemonState {
             config,
             started_at: Utc::now(),
             http_probe,
+            cdp_fetcher,
             memoria: RwLock::new(memoria),
             osint_fuentes: RwLock::new(fuentes_iniciales),
             orquestador,
@@ -780,13 +839,12 @@ impl AuroraDaemonState {
         self.osint_fuentes.write().await.push(fuente);
     }
 
-    /// Devuelve la salud del demonio, enlace hacia BOB y métricas del grafo 4D.
+    /// Devuelve la salud del demonio, diagnóstico por subsistema y métricas del grafo 4D.
     pub async fn health(&self) -> HealthResponse {
-        let bob_online = if self.config.modo_offline {
-            true
-        } else {
-            self.verificar_bob_online().await
-        };
+        let subsistemas = self.sondear_subsistemas().await;
+        let modo_ejecucion = self.config.modo_efectivo();
+        let modo_offline = matches!(modo_ejecucion, ModoEjecucion::SimuladoOffline);
+        let bob_online = subsistemas.bob_llm.disponible;
 
         let (nodos_4d, aristas_4d) = {
             let mem = self.memoria.read().await;
@@ -816,7 +874,8 @@ impl AuroraDaemonState {
             status: "ok".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             bind_addr: self.config.bind_addr.clone(),
-            modo_offline: self.config.modo_offline,
+            modo_offline,
+            modo_ejecucion,
             bob_url: self.config.bob_url.clone(),
             bob_online,
             bob_slot_id: self.config.bob_slot_id,
@@ -826,6 +885,7 @@ impl AuroraDaemonState {
             ),
             hardware_ram_sistema: "AMD Ryzen 9 / 64 GB RAM (OSINT + Memoria 4D + TTS CPU)"
                 .to_string(),
+            subsistemas,
             nodos_4d,
             aristas_4d,
             ordenes_pendientes,
@@ -835,13 +895,23 @@ impl AuroraDaemonState {
         }
     }
 
-    async fn verificar_bob_online(&self) -> bool {
-        let base = self.config.bob_url.trim_end_matches('/');
-        let health_url = format!("{base}/health");
-        match self.http_probe.get(&health_url).send().await {
-            Ok(resp) => resp.status().is_success(),
-            Err(_) => false,
+    /// Ejecuta la sonda en vivo de los 6 subsistemas nativos (BOB, Piper, Chromium, FFmpeg, CDP, SMTP).
+    pub async fn sondear_subsistemas(&self) -> ReporteSubsistemas {
+        SubsystemProbe::ejecutar(&self.config, &self.http_probe).await
+    }
+
+    /// Compacta el WAL 4D y persiste la cola Gatekeeper antes de detener el proceso.
+    pub async fn apagar_ordenadamente(&self) -> DaemonResult<()> {
+        {
+            let mut mem = self.memoria.write().await;
+            mem.flush_y_compactar()?;
         }
+        if let Some(ref ruta) = self.ruta_cola_persistida {
+            let cola = self.cola_gatekeeper.lock();
+            persistir_cola_gatekeeper(ruta, &cola)?;
+        }
+        info!("WAL 4D compactado y cola Gatekeeper persistida en apagado ordenado");
+        Ok(())
     }
 
     /// Ejecuta una cacería OSINT -> ingestión 4D -> perfilamiento BOB y encola en Gatekeeper.
@@ -882,12 +952,40 @@ impl AuroraDaemonState {
                     ));
                 }
                 let http_client = HttpSwarmClient::new(PoliticaHttp::default())?;
-                let adaptador = SenalesAbiertasAdapter::desde_endpoint(
+                let mut adaptador = SenalesAbiertasAdapter::desde_endpoint(
                     "FuentePublicaCockpit",
                     trimmed,
                     req.fuente_formato.unwrap_or(FormatoCrudo::Html),
                     http_client,
                 );
+                if req.requiere_js.unwrap_or(false) {
+                    if let Some(ref cdp) = self.cdp_fetcher {
+                        if cdp.probe_disponible().await {
+                            let fetcher: Arc<dyn DynamicBrowserFetcher> = cdp.clone();
+                            adaptador = adaptador.con_browser_fetcher(fetcher);
+                        } else if matches!(
+                            self.config.modo_efectivo(),
+                            ModoEjecucion::EstrictoReal
+                        ) {
+                            return Err(DaemonError::Osint(OsintError::ConfiguracionHttp(
+                                format!(
+                                    "requiere_js=true en estricto_real pero CDP {} no responde",
+                                    self.config.cdp_url
+                                ),
+                            )));
+                        } else {
+                            warn!(
+                                cdp_url = %self.config.cdp_url,
+                                "requiere_js=true pero endpoint CDP no responde; usando extracción HTML directa"
+                            );
+                        }
+                    } else if matches!(self.config.modo_efectivo(), ModoEjecucion::EstrictoReal) {
+                        return Err(DaemonError::Osint(OsintError::ConfiguracionHttp(
+                            "requiere_js=true pero HttpCdpBrowserFetcher no está configurado"
+                                .to_string(),
+                        )));
+                    }
+                }
                 enjambre.registrar_fuente(Arc::new(adaptador));
                 tiene_fuente = true;
             }
@@ -1158,9 +1256,10 @@ impl AuroraDaemonState {
         orden_id: Uuid,
         req: Option<AprobarOrdenRequest>,
     ) -> DaemonResult<AprobarOrdenResponse> {
-        let despachar_inmediatamente = req
-            .and_then(|r| r.despachar_inmediatamente)
-            .unwrap_or(false);
+        let (despachar_inmediatamente, correo_destino) = match req {
+            Some(r) => (r.despachar_inmediatamente.unwrap_or(false), r.correo_destino),
+            None => (false, None),
+        };
 
         // 1. Extraemos clon y validamos estado PendienteGatekeeper sin sostener lock de Mutex en `.await`.
         let mut reg = {
@@ -1229,10 +1328,11 @@ impl AuroraDaemonState {
             if despachar_inmediatamente {
                 let comprobante = self
                     .despachador
-                    .despachar(
+                    .despachar_con_correo(
                         &paquete,
                         &prospecto,
                         reg.plan.brief_creativo.canal_sugerido,
+                        correo_destino,
                         &mem,
                         ahora + Duration::hours(36),
                     )

@@ -301,6 +301,33 @@ impl MotorMemoriaAurora {
         Ok(())
     }
 
+    /// Vacía buffers y ejecuta `sync_all()` sobre `wal.log` en NVMe sin reescribir snapshot.
+    #[tracing::instrument(skip(self))]
+    pub fn flush_wal(&mut self) -> MemoryResult<()> {
+        let (Some(writer), Some(dir)) = (&mut self.wal_writer, &self.data_dir) else {
+            return Ok(());
+        };
+        let wal_path = dir.join("wal.log");
+        writer.flush().map_err(|e| MemoryError::WalIo {
+            ruta: wal_path.clone(),
+            source: e,
+        })?;
+        writer.get_ref().sync_all().map_err(|e| MemoryError::WalIo {
+            ruta: wal_path,
+            source: e,
+        })?;
+        Ok(())
+    }
+
+    /// Vacía el WAL y consolida atómicamente el snapshot binario `state.bin` en NVMe
+    /// (útil durante apagado limpio ante `SIGTERM`/`Ctrl+C` para persistir pesos 4D recalibrados).
+    #[tracing::instrument(skip(self))]
+    pub fn flush_y_compactar(&mut self) -> MemoryResult<()> {
+        self.flush_wal()?;
+        self.compactar_wal()?;
+        Ok(())
+    }
+
     /// Escribe atómicamente el snapshot `state.bin` (solo registros vivos) y trunca `wal.log`.
     #[tracing::instrument(skip(self))]
     pub fn compactar_wal(&mut self) -> MemoryResult<()> {

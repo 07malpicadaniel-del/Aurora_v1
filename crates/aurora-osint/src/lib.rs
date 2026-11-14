@@ -4,11 +4,14 @@
 //! Opera exclusivamente sobre CPU (`rayon`) y RAM (`tokio` + `reqwest` con `rustls-tls`)
 //! sin instanciar navegadores pesados ni consumir VRAM de inferencia.
 
+pub mod cdp_fetcher;
 pub mod distiller;
 pub mod error;
 pub mod pipeline;
 pub mod resolver;
 pub mod sources;
+
+pub use cdp_fetcher::{ConfigCdpFetcher, HttpCdpBrowserFetcher};
 
 pub use distiller::{
     clasificar_perfil_psicologico, detectar_gatillos, estimar_capacidad_adquisitiva,
