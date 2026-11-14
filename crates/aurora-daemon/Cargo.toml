@@ -1,0 +1,39 @@
+[package]
+name = "aurora-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "aurora_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aurora-daemon"
+path = "src/main.rs"
+
+[dependencies]
+aurora-domain.workspace = true
+aurora-osint.workspace = true
+aurora-memory.workspace = true
+aurora-cortex.workspace = true
+aurora-factory.workspace = true
+aurora-pulse.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+parking_lot.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

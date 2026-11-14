@@ -345,6 +345,11 @@ impl GrafoTemporal4D {
         self.relaciones_unicas.len()
     }
 
+    /// Itera sobre los prospectos activos del grafo 4D.
+    pub fn iter_nodos(&self) -> impl Iterator<Item = &RegistroNodoProspecto> {
+        self.nodos.values()
+    }
+
     /// Itera sobre las relaciones canónicas activas (para compactación de snapshots).
     pub fn iter_relaciones(&self) -> impl Iterator<Item = &RelacionTopologica> {
         self.relaciones_unicas.values()

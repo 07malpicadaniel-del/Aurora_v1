@@ -6,6 +6,7 @@ members = [
     "crates/aurora-cortex",
     "crates/aurora-factory",
     "crates/aurora-pulse",
+    "crates/aurora-daemon",
 ]
 resolver = "2"
 
@@ -39,6 +40,11 @@ aurora-memory = { path = "crates/aurora-memory" }
 aurora-cortex = { path = "crates/aurora-cortex" }
 aurora-factory = { path = "crates/aurora-factory" }
 aurora-pulse = { path = "crates/aurora-pulse" }
+aurora-daemon = { path = "crates/aurora-daemon" }
+axum = { version = "0.8", features = ["ws"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
