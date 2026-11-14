@@ -21,13 +21,26 @@ use chrono::Utc;
 use reqwest::Client;
 use uuid::Uuid;
 
-const MODELO_BOB_QWEN: &str = "Qwen3.8-27B-Uncensored-noMTP-IQ4_XS.gguf";
+const MODELO_PREFERIDO_DEFAULT: &str = "gemma-2-9b-it-abliterated-Q4_K_M.gguf (9B-14B VRAM<=12GB) / Qwen3.8-27B";
+
+async fn consultar_modelo_activo_bob(http_client: &Client, bob_url: &str) -> Option<String> {
+    let url = format!("{}/props", bob_url.trim_end_matches('/'));
+    let resp = http_client.get(url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let val: serde_json::Value = resp.json().await.ok()?;
+    val.get("model_alias")
+        .and_then(|v| v.as_str())
+        .or_else(|| val.get("model_path").and_then(|v| v.as_str()))
+        .map(str::to_string)
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
     println!("==============================================================");
     println!(" Aurora v2 :: Smoke Test de Subsistemas & Inferencia BOB Real");
-    println!(" Modelo residente esperado: {MODELO_BOB_QWEN}");
+    println!(" Perfil GPU RTX 5060 Ti (16 GB): {MODELO_PREFERIDO_DEFAULT}");
     println!("==============================================================");
 
     let config = match AuroraDaemonConfig::cargar_desde_toml_y_entorno() {
@@ -71,14 +84,15 @@ async fn main() -> ExitCode {
 
     if !reporte.bob_llm.modo_real_activo {
         println!("[INFO] BOB LLM no responde en {}. Smoke test completado sin inferencia.", config.bob_url);
-        println!("       Para encender BOB con {MODELO_BOB_QWEN} en Arch Linux (RTX 5060 Ti 16 GB VRAM):");
+        println!("       Para encender BOB (techo <= 12.5 GB VRAM) en Arch Linux:");
         println!();
-        println!("       ./build/bin/llama-server \\");
-        println!("         -m models/{MODELO_BOB_QWEN} \\");
-        println!("         --host 127.0.0.1 --port 8085 \\");
-        println!("         -ngl 99 -np 1 -c 8192 -b 512 \\");
-        println!("         -ctk q8_0 -ctv q8_0 -fa on");
+        println!("       llama-server -m models/gemma-2-9b-it-abliterated-Q4_K_M.gguf \\");
+        println!("         --host 127.0.0.1 --port 8085 -ngl 99 -np 1 -c 8192 -b 512 -ctk q8_0 -ctv q8_0 -fa on");
         return ExitCode::SUCCESS;
+    }
+
+    if let Some(modelo_activo) = consultar_modelo_activo_bob(&http_client, &config.bob_url).await {
+        println!("Modelo activo en BOB (:8085 /props): {modelo_activo}");
     }
 
     println!(

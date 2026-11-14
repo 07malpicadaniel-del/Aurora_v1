@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 use crate::error::{CortexError, CortexResult};
 use crate::roles::{AjusteEstrategiaAuditor, BriefCreativo, DiagnosticoComercial, RolCognitivo};
 
-const GBNF_PRIMITIVAS_COMUNES: &str = r#"ws ::= [ \t\n\r]*
+const GBNF_PRIMITIVAS_COMUNES: &str = r#"ws ::= (" " | "\n" (" " | "  " | "    ")?)?
 json-string ::= "\"" string-char* "\"" ws
 string-char ::= [^"\\\x00-\x1f] | "\\" escape-char
 escape-char ::= ["\\/bfnrt] | "u" hex-digit hex-digit hex-digit hex-digit
@@ -15,7 +15,7 @@ uuid-str ::= "\"" hex8 "-" hex4 "-" hex4 "-" hex4 "-" hex12 "\"" ws
 hex4 ::= hex-digit hex-digit hex-digit hex-digit
 hex8 ::= hex4 hex4
 hex12 ::= hex4 hex4 hex4
-probabilidad ::= ("0" ("." digit-seq)? | "1" (".0" "0"*)?) ws
+probabilidad ::= ("0" ("." digit-seq)? | "1" ".0"?) ws
 digit-seq ::= [0-9] [0-9]? [0-9]? [0-9]?
 uint-small ::= ([1-9] [0-9]?) ws
 bool-val ::= ("true" | "false") ws
@@ -30,7 +30,8 @@ canal-contacto ::= ("\"WhatsApp\"" | "\"LinkedIn\"" | "\"CorreoEjecutivo\"" | "\
 #[must_use]
 pub fn gbnf_diagnostico_comercial() -> String {
     format!(
-        r#"root ::= "{{" ws
+        r#"root ::= (
+  "{{" ws
   "\"prospecto_id\"" ws ":" ws uuid-str "," ws
   "\"vertical_optima\"" ws ":" ws vertical-comercial "," ws
   "\"producto_gancho\"" ws ":" ws json-string "," ws
@@ -38,7 +39,8 @@ pub fn gbnf_diagnostico_comercial() -> String {
   "\"angulo_entrada\"" ws ":" ws json-string "," ws
   "\"probabilidad_cierre\"" ws ":" ws probabilidad "," ws
   "\"justificacion_topologica\"" ws ":" ws json-string
-"}}" ws
+  "}}" ws
+)
 {GBNF_PRIMITIVAS_COMUNES}"#
     )
 }
@@ -47,7 +49,8 @@ pub fn gbnf_diagnostico_comercial() -> String {
 #[must_use]
 pub fn gbnf_brief_creativo() -> String {
     format!(
-        r#"root ::= "{{" ws
+        r#"root ::= (
+  "{{" ws
   "\"prospecto_id\"" ws ":" ws uuid-str "," ws
   "\"perfil_psicologico\"" ws ":" ws perfil-psicologico "," ws
   "\"gancho_3s\"" ws ":" ws json-string "," ws
@@ -56,14 +59,17 @@ pub fn gbnf_brief_creativo() -> String {
   "\"escenas_reel\"" ws ":" ws escenas-array "," ws
   "\"secciones_dossier_pdf\"" ws ":" ws string-array "," ws
   "\"canal_sugerido\"" ws ":" ws canal-contacto
-"}}" ws
+  "}}" ws
+)
 escenas-array ::= "[" ws escena-item ("," ws escena-item)* "]" ws
-escena-item ::= "{{" ws
+escena-item ::= (
+  "{{" ws
   "\"indice\"" ws ":" ws uint-small "," ws
   "\"duracion_segundos\"" ws ":" ws uint-small "," ws
   "\"descripcion_visual\"" ws ":" ws json-string "," ws
   "\"texto_overlay\"" ws ":" ws json-string
-"}}" ws
+  "}}" ws
+)
 string-array ::= "[" ws json-string ("," ws json-string)* "]" ws
 {GBNF_PRIMITIVAS_COMUNES}"#
     )
@@ -91,14 +97,16 @@ tipo-interaccion ::= ("\"ComentarioValor\"" | "\"ReaccionContextual\"" | "\"Invi
 #[must_use]
 pub fn gbnf_ajuste_auditor() -> String {
     format!(
-        r#"root ::= "{{" ws
+        r#"root ::= (
+  "{{" ws
   "\"campana_id\"" ws ":" ws uuid-str "," ws
   "\"factor_ajuste_urgencia\"" ws ":" ws factor-urgencia "," ws
   "\"nuevo_gancho_sugerido\"" ws ":" ws json-string "," ws
   "\"diagnostico_rendimiento\"" ws ":" ws json-string "," ws
   "\"requiere_pausa_vertical\"" ws ":" ws bool-val
-"}}" ws
-factor-urgencia ::= ("0." [5-9] digit-seq? | "1." [0-4] digit-seq? | "1.5" "0"* | "1" | "0.5") ws
+  "}}" ws
+)
+factor-urgencia ::= ("0." [5-9] digit-seq? | "1." [0-4] digit-seq? | "1.5" | "1.0" | "1" | "0.5") ws
 {GBNF_PRIMITIVAS_COMUNES}"#
     )
 }
@@ -400,4 +408,35 @@ where
     valor.validar_semantica(rol)?;
     debug!(rol = rol.etiqueta(), "Respuesta GBNF/JSON validada estrictamente");
     Ok(valor)
+}
+
+#[cfg(test)]
+mod gbnf_llamacpp_compat_tests {
+    use super::*;
+
+    #[test]
+    fn gramaticas_multilinea_envueltas_en_parentesis_y_ws_acotado() {
+        for g in [
+            gbnf_diagnostico_comercial(),
+            gbnf_brief_creativo(),
+            gbnf_tool_call(),
+            gbnf_ajuste_auditor(),
+        ] {
+            assert!(validar_sintaxis_gbnf(&g).is_ok());
+            assert!(!g.contains("ws ::= [ \\t\\n\\r]*"));
+            // Ninguna línea sin `::=` puede quedar con paréntesis abierto en 0 salvo cierre `)`.
+            let mut depth = 0i32;
+            for line in g.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                if !line.contains("::=") && line != ")" {
+                    assert!(
+                        depth > 0,
+                        "línea multilínea fuera de paréntesis en GBNF: {line}"
+                    );
+                }
+                depth += line.chars().filter(|&c| c == '(').count() as i32;
+                depth -= line.chars().filter(|&c| c == ')').count() as i32;
+            }
+            assert_eq!(depth, 0);
+        }
+    }
 }

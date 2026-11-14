@@ -244,11 +244,14 @@ impl BobInferenceBackend for HttpBobCortexClient {
     }
 }
 
-/// Normaliza salidas ChatML de Qwen (`Qwen3.8-27B-Uncensored-noMTP-IQ4_XS.gguf`),
-/// eliminando tokens de cierre (`<|im_end|>`, `<|endoftext|>`) y bloques `<think>...</think>`
-/// si van seguidos del payload JSON útil.
+/// Normaliza salidas de `llama-server` (Qwen ChatML y Gemma `<end_of_turn>`),
+/// eliminando tokens de fin y bloques `<think>...</think>` si van seguidos del JSON útil.
 fn limpiar_salida_qwen(raw: &str) -> String {
-    let sin_tokens = raw.replace("<|im_end|>", "").replace("<|endoftext|>", "");
+    let sin_tokens = raw
+        .replace("<|im_end|>", "")
+        .replace("<|endoftext|>", "")
+        .replace("<end_of_turn>", "")
+        .replace("<eos>", "");
     if let Some(pos_cierre) = sin_tokens.rfind("</think>") {
         let antes = sin_tokens[..pos_cierre].trim_start();
         let resto = sin_tokens[pos_cierre + "</think>".len()..].trim();
@@ -286,6 +289,9 @@ mod qwen_tests {
 
         let json_puro = "{\"texto\":\"literal </think> interno\"}";
         assert_eq!(limpiar_salida_qwen(json_puro), json_puro);
+
+        let gemma_fin = "{\"ok\":true}<end_of_turn><eos>";
+        assert_eq!(limpiar_salida_qwen(gemma_fin), "{\"ok\":true}");
         assert_eq!(ConfigHttpBob::default().timeout_ms, 60_000);
     }
 }

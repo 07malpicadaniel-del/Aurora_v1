@@ -296,7 +296,7 @@ impl FfmpegNvencComposer {
             return false;
         }
 
-        // Prueba relámpago de apertura real del encoder NVENC para no fallar si no hay GPU activa.
+        // Prueba relámpago de apertura real del encoder NVENC (NVENC requiere >= 256x256 en Blackwell/RTX 50xx).
         let probe_hw = Command::new(&self.config.binario_ffmpeg)
             .args([
                 "-hide_banner",
@@ -305,7 +305,7 @@ impl FfmpegNvencComposer {
                 "-f",
                 "lavfi",
                 "-i",
-                "color=c=black:s=64x64:d=0.1",
+                "color=c=black:s=256x256:d=0.1",
                 "-frames:v",
                 "1",
                 "-c:v",
