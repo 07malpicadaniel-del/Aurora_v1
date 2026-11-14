@@ -4,7 +4,8 @@
 # Dirección HTTP/WebSocket/SSE local consumida por el Cockpit axis_v1
 bind_addr = "127.0.0.1:8090"
 
-# Endpoint único del modelo residente en RTX 5060 Ti (slot_id = 0 obligatorio)
+# Endpoint único del modelo residente en RTX 5060 Ti (Qwen 3.8 27B, slot_id = 0 obligatorio)
+# Diagnóstico rápido de conectividad e inferencia GBNF: `cargo run -p aurora-daemon --bin aurora-smoke`
 bob_url = "http://127.0.0.1:8085"
 bob_slot_id = 0
 

@@ -2,8 +2,9 @@
 //! y registro determinista de herramientas bajo supervisión Gatekeeper (Fase 3).
 //!
 //! Diseñado para operar con **un único modelo residente en los 16 GB VRAM**
-//! de la RTX 5060 Ti (`llama-server` en `http://127.0.0.1:8085`, `slot_id = 0`),
-//! alternando dinámicamente roles cognitivos mediante prompt de sistema y gramática GBNF.
+//! de la RTX 5060 Ti (`llama-server` ejecutando `Qwen3.8-27B-Uncensored-noMTP-IQ4_XS.gguf`
+//! en `http://127.0.0.1:8085`, `slot_id = 0`), alternando dinámicamente roles cognitivos
+//! mediante plantilla ChatML y gramática GBNF.
 
 pub mod engine;
 pub mod error;

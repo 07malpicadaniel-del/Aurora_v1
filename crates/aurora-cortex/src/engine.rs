@@ -66,7 +66,7 @@ impl Default for ConfigHttpBob {
             url_base: DEFAULT_BOB_URL.to_string(),
             slot_id: 0,
             n_predict: 2048,
-            timeout_ms: 30_000,
+            timeout_ms: 60_000,
             max_reintentos: 2,
             cache_prompt: true,
         }
@@ -244,7 +244,53 @@ impl BobInferenceBackend for HttpBobCortexClient {
     }
 }
 
+/// Normaliza salidas ChatML de Qwen (`Qwen3.8-27B-Uncensored-noMTP-IQ4_XS.gguf`),
+/// eliminando tokens de cierre (`<|im_end|>`, `<|endoftext|>`) y bloques `<think>...</think>`
+/// si van seguidos del payload JSON útil.
+fn limpiar_salida_qwen(raw: &str) -> String {
+    let sin_tokens = raw.replace("<|im_end|>", "").replace("<|endoftext|>", "");
+    if let Some(pos_cierre) = sin_tokens.rfind("</think>") {
+        let antes = sin_tokens[..pos_cierre].trim_start();
+        let resto = sin_tokens[pos_cierre + "</think>".len()..].trim();
+        if (antes.starts_with("<think>") || !antes.starts_with('{')) && !resto.is_empty() {
+            return resto.to_string();
+        }
+    }
+    sin_tokens.trim().to_string()
+}
+
 fn extraer_contenido_respuesta(resp: LlamaCompletionResponse) -> Option<String> {
+    let crudo = extraer_contenido_crudo(resp)?;
+    let limpio = limpiar_salida_qwen(&crudo);
+    if limpio.is_empty() {
+        None
+    } else {
+        Some(limpio)
+    }
+}
+
+#[cfg(test)]
+mod qwen_tests {
+    use super::*;
+
+    #[test]
+    fn limpia_bloques_think_y_tokens_chatml_de_qwen() {
+        let salida = "<think>Analizando perfil del corredor Veracruz.</think>\n{\"nivel_encaje_0_100\":91}<|im_end|>";
+        assert_eq!(
+            limpiar_salida_qwen(salida),
+            "{\"nivel_encaje_0_100\":91}"
+        );
+
+        let sin_apertura = "pensamiento prefill\n</think>\n{\"ok\":true}<|endoftext|>";
+        assert_eq!(limpiar_salida_qwen(sin_apertura), "{\"ok\":true}");
+
+        let json_puro = "{\"texto\":\"literal </think> interno\"}";
+        assert_eq!(limpiar_salida_qwen(json_puro), json_puro);
+        assert_eq!(ConfigHttpBob::default().timeout_ms, 60_000);
+    }
+}
+
+fn extraer_contenido_crudo(resp: LlamaCompletionResponse) -> Option<String> {
     if let Some(content) = resp.content {
         if !content.trim().is_empty() {
             return Some(content);

@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "aurora-daemon"
 path = "src/main.rs"
 
+[[bin]]
+name = "aurora-smoke"
+path = "src/bin/aurora_smoke.rs"
+
 [dependencies]
 aurora-domain.workspace = true
 aurora-osint.workspace = true
