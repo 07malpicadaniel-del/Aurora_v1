@@ -37,6 +37,7 @@ Para evitar saturación térmica y errores OOM en sesiones autónomas largas:
 | :--- | :--- | :--- | :--- |
 | `aurora-domain` | `crates/aurora-domain` | **Completa (Fase 0)** | Modelos canónicos, errores `AuroraError`, validación determinista LFPDPPP, puente `IntoVectorPayload`. |
 | `aurora-osint` | `crates/aurora-osint` | **Completa (Fase 1)** | Enjambre asíncrono de extracción OSINT sobre fuentes públicas mexicanas y normalización en memoria. |
+| `aurora-memory` | `crates/aurora-memory` | **Completa (Fase 2)** | Telaraña topológica 4D, embeddings multilingües CPU/RAM, islas vectoriales SIMD y WAL NVMe con purga física LFPDPPP. |
 | `aurora-factory` | `crates/aurora-factory` | Stub (Fase 4) | Generación local de `DossierPdf`, `NotaVozTts`, `ReelVerticalMp4` y `MensajeDirecto`. |
 | `aurora-pulse` | `crates/aurora-pulse` | Stub (Fase 5) | Colas de despacho supervisado por Gatekeeper y puente hacia `../axis_v1`. |
 

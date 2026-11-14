@@ -2,6 +2,7 @@
 members = [
     "crates/aurora-domain",
     "crates/aurora-osint",
+    "crates/aurora-memory",
     "crates/aurora-factory",
     "crates/aurora-pulse",
 ]
@@ -30,7 +31,10 @@ strsim = "0.11"
 regex = "1.13"
 unicode-normalization = "0.1"
 async-trait = "0.1"
+parking_lot = "0.12"
 aurora-domain = { path = "crates/aurora-domain" }
+aurora-osint = { path = "crates/aurora-osint" }
+aurora-memory = { path = "crates/aurora-memory" }
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

@@ -61,6 +61,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "aurora-memory"
+version = "0.1.0"
+dependencies = [
+ "aurora-domain",
+ "aurora-osint",
+ "bincode",
+ "chrono",
+ "parking_lot",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "unicode-normalization",
+ "uuid",
+]
+
+[[package]]
 name = "aurora-osint"
 version = "0.1.0"
 dependencies = [
