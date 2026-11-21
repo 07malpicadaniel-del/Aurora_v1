@@ -493,6 +493,15 @@ pub struct PulseEstadoResponse {
 /// Respuesta de `POST /api/v1/dpo/consolidar`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DpoConsolidarResponse {
+    /// Número de campañas auditadas en la corrida (0 cuando no hay telemetría nueva).
+    #[serde(default)]
+    pub campanas_auditadas: usize,
+    /// Indica si la consolidación terminó en modo idempotente *no-op* sin eventos nuevos.
+    #[serde(default)]
+    pub modo_noop: bool,
+    /// Mensaje legible para el operador sobre el resultado de la consolidación.
+    #[serde(default)]
+    pub mensaje: String,
     /// Dataset JSONL generado y conteos de recalibración 4D aplicados.
     pub dataset: DatasetPreferenciasDpo,
 }
@@ -1053,62 +1062,14 @@ impl AuroraDaemonState {
                     }
                 };
 
-                let plan = self
-                    .orquestador
-                    .generar_plan_ataque(&subgrafo, campana_id, &mem)
+                let registro = self
+                    .construir_registro_orden(&mem, &subgrafo, campana_id)
                     .await?;
-
-                let llamado_warm = AuroraToolCall::ProgramarCalentamientoPeriferico {
-                    prospecto_id: prospecto.id,
-                    plataforma: PlataformaCalentamiento::LinkedIn,
-                    tipo_interaccion: TipoInteraccionPeriferica::ComentarioValor,
-                    contexto_publico: format!(
-                        "{} ({})",
-                        prospecto.lfpdppp.fuente_origen,
-                        prospecto
-                            .gatillos
-                            .first()
-                            .map_or("actividad empresarial pública", |g| g.descripcion.as_str())
-                    ),
-                };
-
-                let calentamiento = match ToolDispatcher.ejecutar(&llamado_warm, campana_id, &mem) {
-                    Ok(ResultadoEjecucionTool::CalentamientoProgramado(cal)) => Some(*cal),
-                    _ => None,
-                };
-
-                let ubicacion_str = format!(
-                    "{}, {}",
-                    prospecto.ubicacion.ciudad, prospecto.ubicacion.estado
-                );
-                let registro = RegistroOrdenInterno {
-                    plan,
-                    prospecto_nombre: prospecto.nombre_normalizado.clone(),
-                    perfil_psicologico: prospecto.perfil_psicologico,
-                    ubicacion: ubicacion_str,
-                    isla,
-                    motivo_rechazo: None,
-                    calentamiento,
-                    paquete_manufacturado: None,
-                    comprobante_despacho: None,
-                    actualizado_en: Utc::now(),
-                };
                 planes_encolados.push(registro);
             }
         }
 
-        let mut dtos = Vec::with_capacity(planes_encolados.len());
-        {
-            let mut cola = self.cola_gatekeeper.lock();
-            for reg in planes_encolados {
-                let dto = reg.a_dto();
-                cola.insert(dto.orden_id, reg);
-                dtos.push(dto);
-            }
-            if let Some(ref ruta) = self.ruta_cola_persistida {
-                persistir_cola_gatekeeper(ruta, &cola)?;
-            }
-        }
+        let dtos = self.encolar_registros_gatekeeper(planes_encolados)?;
 
         self.emitir_evento(
             "HuntCompletado",
@@ -1128,6 +1089,109 @@ impl AuroraDaemonState {
             excluidos_opt_out,
             planes_encolados: dtos,
         })
+    }
+
+    /// Genera una nueva propuesta comercial con BOB para un prospecto ya existente en la Telaraña 4D
+    /// y la encola directamente en Sala Gatekeeper para revisión humana.
+    #[tracing::instrument(skip(self), fields(prospecto_id = %prospecto_id))]
+    pub async fn generar_plan_para_prospecto(
+        &self,
+        prospecto_id: Uuid,
+    ) -> DaemonResult<OrdenPendienteDto> {
+        let campana_id = Uuid::new_v4();
+        let ahora = Utc::now();
+
+        let registro = {
+            let mem = self.memoria.read().await;
+            if mem.esta_en_blacklist(prospecto_id) {
+                return Err(DaemonError::OptOutActivo(prospecto_id));
+            }
+            let subgrafo = construir_subgrafo_por_uuid(&mem, prospecto_id, ahora)?;
+            self.construir_registro_orden(&mem, &subgrafo, campana_id)
+                .await?
+        };
+
+        let dtos = self.encolar_registros_gatekeeper(vec![registro])?;
+        let dto = dtos.into_iter().next().ok_or_else(|| {
+            DaemonError::Interno("no se pudo recuperar la orden recién encolada".to_string())
+        })?;
+
+        self.emitir_evento(
+            "PlanGenerado",
+            serde_json::json!({
+                "orden_id": dto.orden_id,
+                "prospecto_id": prospecto_id,
+                "campana_id": campana_id,
+            }),
+        );
+
+        Ok(dto)
+    }
+
+    async fn construir_registro_orden(
+        &self,
+        mem: &MotorMemoriaAurora,
+        subgrafo: &SubgrafoProspecto,
+        campana_id: Uuid,
+    ) -> DaemonResult<RegistroOrdenInterno> {
+        let prospecto = &subgrafo.prospecto;
+        let plan = self
+            .orquestador
+            .generar_plan_ataque(subgrafo, campana_id, mem)
+            .await?;
+
+        let llamado_warm = AuroraToolCall::ProgramarCalentamientoPeriferico {
+            prospecto_id: prospecto.id,
+            plataforma: PlataformaCalentamiento::LinkedIn,
+            tipo_interaccion: TipoInteraccionPeriferica::ComentarioValor,
+            contexto_publico: format!(
+                "{} ({})",
+                prospecto.lfpdppp.fuente_origen,
+                prospecto
+                    .gatillos
+                    .first()
+                    .map_or("actividad empresarial pública", |g| g.descripcion.as_str())
+            ),
+        };
+
+        let calentamiento = match ToolDispatcher.ejecutar(&llamado_warm, campana_id, mem) {
+            Ok(ResultadoEjecucionTool::CalentamientoProgramado(cal)) => Some(*cal),
+            _ => None,
+        };
+
+        let ubicacion_str = format!(
+            "{}, {}",
+            prospecto.ubicacion.ciudad, prospecto.ubicacion.estado
+        );
+        Ok(RegistroOrdenInterno {
+            plan,
+            prospecto_nombre: prospecto.nombre_normalizado.clone(),
+            perfil_psicologico: prospecto.perfil_psicologico,
+            ubicacion: ubicacion_str,
+            isla: subgrafo.isla,
+            motivo_rechazo: None,
+            calentamiento,
+            paquete_manufacturado: None,
+            comprobante_despacho: None,
+            actualizado_en: Utc::now(),
+        })
+    }
+
+    fn encolar_registros_gatekeeper(
+        &self,
+        registros: Vec<RegistroOrdenInterno>,
+    ) -> DaemonResult<Vec<OrdenPendienteDto>> {
+        let mut dtos = Vec::with_capacity(registros.len());
+        let mut cola = self.cola_gatekeeper.lock();
+        for reg in registros {
+            let dto = reg.a_dto();
+            cola.insert(dto.orden_id, reg);
+            dtos.push(dto);
+        }
+        if let Some(ref ruta) = self.ruta_cola_persistida {
+            persistir_cola_gatekeeper(ruta, &cola)?;
+        }
+        Ok(dtos)
     }
 
     /// Devuelve la topología completa 4D (nodos, gatillos vigentes, aristas) para `axis_v1`.
@@ -1555,7 +1619,7 @@ impl AuroraDaemonState {
         let dataset = {
             let mut mem = self.memoria.write().await;
             self.motor_dpo
-                .ejecutar_consolidacion_nocturna(&self.telemetria, &mut mem)
+                .consolidar(&self.telemetria, &mut mem)
                 .await?
         };
 
@@ -1565,10 +1629,18 @@ impl AuroraDaemonState {
                 "ruta_jsonl": dataset.ruta_jsonl,
                 "entradas": dataset.entradas.len(),
                 "nodos_4d_recalibrados": dataset.nodos_4d_recalibrados,
+                "campanas_auditadas": dataset.campanas_auditadas.len(),
+                "modo_noop": dataset.modo_noop,
+                "mensaje": dataset.mensaje,
             }),
         );
 
-        Ok(DpoConsolidarResponse { dataset })
+        Ok(DpoConsolidarResponse {
+            campanas_auditadas: dataset.campanas_auditadas.len(),
+            modo_noop: dataset.modo_noop,
+            mensaje: dataset.mensaje.clone(),
+            dataset,
+        })
     }
 
     fn emitir_evento(&self, tipo: &str, payload: serde_json::Value) {

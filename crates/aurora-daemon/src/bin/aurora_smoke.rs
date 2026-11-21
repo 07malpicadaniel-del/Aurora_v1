@@ -21,7 +21,7 @@ use chrono::Utc;
 use reqwest::Client;
 use uuid::Uuid;
 
-const MODELO_PREFERIDO_DEFAULT: &str = "gemma-2-9b-it-abliterated-Q4_K_M.gguf (9B-14B VRAM<=12GB) / Qwen3.8-27B";
+const MODELO_PREFERIDO_DEFAULT: &str = "gemma-3-12b-it-Q4_K_M.gguf (12B Q4_K_M VRAM<=12GB) / Qwen3.8-27B";
 
 async fn consultar_modelo_activo_bob(http_client: &Client, bob_url: &str) -> Option<String> {
     let url = format!("{}/props", bob_url.trim_end_matches('/'));

@@ -828,3 +828,33 @@ async fn test_consolidacion_nocturna_dpo_recalibra_grafo_4d_y_genera_jsonl(
     let _ = fs::remove_dir_all(&dir_dpo);
     Ok(())
 }
+
+#[tokio::test]
+async fn test_consolidacion_dpo_es_idempotente_sin_eventos(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let embedder = Arc::new(DeterministicSimdEmbedder::default());
+    let mut memoria = MotorMemoriaAurora::en_memoria(embedder, ConfigDecaimiento4D::default());
+    let telemetria = RecolectorTelemetria::new();
+    let dir_dpo = dir_temporal_prueba("aurora_dpo_noop");
+
+    let motor_dpo = MotorConsolidacionNocturna::new(
+        OrquestadorComercialBob::new(DeterministicMockBob),
+        ConfigConsolidacionNocturna {
+            directorio_salida_dpo: dir_dpo.clone(),
+            ..ConfigConsolidacionNocturna::default()
+        },
+    );
+
+    let reporte = motor_dpo.consolidar(&telemetria, &mut memoria).await?;
+    assert!(reporte.modo_noop);
+    assert!(reporte.campanas_auditadas.is_empty());
+    assert!(reporte.entradas.is_empty());
+    assert_eq!(reporte.nodos_4d_recalibrados, 0);
+    assert_eq!(
+        reporte.mensaje,
+        "Sin eventos de telemetría nuevos para consolidar"
+    );
+
+    let _ = fs::remove_dir_all(&dir_dpo);
+    Ok(())
+}

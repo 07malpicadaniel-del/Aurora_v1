@@ -65,7 +65,7 @@ pub struct EntradaPreferenciaDpo {
 /// Resultado integral de una ejecución nocturna del ciclo DPO y recalibración 4D.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatasetPreferenciasDpo {
-    /// Ruta absoluta o relativa del archivo `.jsonl` persistido en NVMe.
+    /// Ruta absoluta o relativa del archivo `.jsonl` persistido en NVMe (o directorio DPO en modo no-op).
     pub ruta_jsonl: PathBuf,
     /// Entradas DPO escritas en el archivo.
     pub entradas: Vec<EntradaPreferenciaDpo>,
@@ -77,7 +77,16 @@ pub struct DatasetPreferenciasDpo {
     pub aristas_4d_recalibradas: usize,
     /// Marca temporal UTC de cierre del lote nocturno.
     pub generado_en: DateTime<Utc>,
+    /// Indica si la ejecución terminó en modo idempotente *no-op* por falta de eventos nuevos.
+    #[serde(default)]
+    pub modo_noop: bool,
+    /// Mensaje resumen en español para operadores y API.
+    #[serde(default)]
+    pub mensaje: String,
 }
+
+/// Alias semántico del reporte de consolidación nocturna DPO.
+pub type ReporteConsolidacionDpo = DatasetPreferenciasDpo;
 
 /// Orquestador nocturno que conecta telemetría real, `RolCognitivo::Auditor` de BOB,
 /// recalibración del `GrafoTemporal4D` y exportación de preferencias DPO en JSONL.
@@ -106,11 +115,22 @@ impl<B: BobInferenceBackend> MotorConsolidacionNocturna<B> {
         &self.config
     }
 
-    /// Ejecuta el ciclo circadiano completo:
-    /// 1. Consolida métricas por campaña desde `telemetria`.
-    /// 2. Invoca a BOB (`RolCognitivo::Auditor`) por gramática GBNF estricta.
-    /// 3. Recalibra decaimiento $\lambda$ y pesos/hiperaristas del `GrafoTemporal4D`.
-    /// 4. Contrasta ganchos exitosos (`chosen`) vs de baja retención (`rejected`) y escribe JSONL DPO.
+    /// Alias idempotente para ejecutar la consolidación nocturna de telemetría DPO.
+    pub async fn consolidar(
+        &self,
+        telemetria: &RecolectorTelemetria,
+        memoria: &mut MotorMemoriaAurora,
+    ) -> PulseResult<ReporteConsolidacionDpo> {
+        self.ejecutar_consolidacion_nocturna(telemetria, memoria)
+            .await
+    }
+
+    /// Ejecuta el ciclo circadiano completo de manera idempotente:
+    /// 1. Si no hay campañas ni eventos nuevos de telemetría, retorna un reporte *no-op* sin error.
+    /// 2. Consolida métricas por campaña desde `telemetria`.
+    /// 3. Invoca a BOB (`RolCognitivo::Auditor`) por gramática GBNF estricta.
+    /// 4. Recalibra decaimiento $\lambda$ y pesos/hiperaristas del `GrafoTemporal4D`.
+    /// 5. Contrasta ganchos exitosos (`chosen`) vs de baja retención (`rejected`) y escribe JSONL DPO.
     #[tracing::instrument(skip(self, telemetria, memoria))]
     pub async fn ejecutar_consolidacion_nocturna(
         &self,
@@ -118,11 +138,19 @@ impl<B: BobInferenceBackend> MotorConsolidacionNocturna<B> {
         memoria: &mut MotorMemoriaAurora,
     ) -> PulseResult<DatasetPreferenciasDpo> {
         let campanas = telemetria.campanas_registradas();
-        if campanas.is_empty() {
-            return Err(PulseError::ConsolidacionDpoFallida(
-                "no existen campañas con telemetría para ejecutar consolidación nocturna"
-                    .to_string(),
-            ));
+        if campanas.is_empty() || telemetria.total_eventos() == 0 {
+            let ahora = Utc::now();
+            info!("Consolidación DPO en modo no-op: sin eventos de telemetría nuevos");
+            return Ok(DatasetPreferenciasDpo {
+                ruta_jsonl: self.config.directorio_salida_dpo.clone(),
+                entradas: Vec::new(),
+                campanas_auditadas: Vec::new(),
+                nodos_4d_recalibrados: 0,
+                aristas_4d_recalibradas: 0,
+                generado_en: ahora,
+                modo_noop: true,
+                mensaje: "Sin eventos de telemetría nuevos para consolidar".to_string(),
+            });
         }
 
         let limite = self.config.max_campanas_por_lote.max(1);
@@ -195,14 +223,32 @@ impl<B: BobInferenceBackend> MotorConsolidacionNocturna<B> {
         );
 
         if entradas.is_empty() {
-            return Err(PulseError::ConsolidacionDpoFallida(
-                "no hubo pares chosen/rejected suficientes para generar preferencias DPO"
-                    .to_string(),
-            ));
+            let mensaje = "Campañas auditadas en memoria 4D; sin pares contrastantes suficientes para nuevo lote DPO".to_string();
+            info!(
+                campanas_auditadas = campanas_auditadas.len(),
+                nodos_4d_recalibrados,
+                aristas_4d_recalibradas,
+                "Consolidación DPO finalizada sin nuevo JSONL por falta de contraste"
+            );
+            return Ok(DatasetPreferenciasDpo {
+                ruta_jsonl: self.config.directorio_salida_dpo.clone(),
+                entradas: Vec::new(),
+                campanas_auditadas,
+                nodos_4d_recalibrados,
+                aristas_4d_recalibradas,
+                generado_en: ahora,
+                modo_noop: true,
+                mensaje,
+            });
         }
 
         let ruta_jsonl =
             persistir_dataset_jsonl(&self.config.directorio_salida_dpo, &entradas, ahora)?;
+
+        let mensaje = format!(
+            "Consolidación nocturna DPO completada: {} preferencias exportadas",
+            entradas.len()
+        );
 
         info!(
             ruta_jsonl = %ruta_jsonl.display(),
@@ -220,6 +266,8 @@ impl<B: BobInferenceBackend> MotorConsolidacionNocturna<B> {
             nodos_4d_recalibrados,
             aristas_4d_recalibradas,
             generado_en: ahora,
+            modo_noop: false,
+            mensaje,
         })
     }
 

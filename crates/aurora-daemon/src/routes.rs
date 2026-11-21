@@ -38,6 +38,10 @@ pub fn crear_router(state: Arc<AuroraDaemonState>) -> Router {
             get(handler_subgrafo),
         )
         .route(
+            "/api/v1/cortex/generar-plan/{prospecto_id}",
+            post(handler_cortex_generar_plan),
+        )
+        .route(
             "/api/v1/gatekeeper/pendientes",
             get(handler_gatekeeper_pendientes),
         )
@@ -91,6 +95,14 @@ async fn handler_subgrafo(
 ) -> DaemonResult<Json<SubgrafoProspecto>> {
     let subgrafo = state.obtener_subgrafo(prospecto_id).await?;
     Ok(Json(subgrafo))
+}
+
+async fn handler_cortex_generar_plan(
+    State(state): State<Arc<AuroraDaemonState>>,
+    Path(prospecto_id): Path<Uuid>,
+) -> DaemonResult<Json<OrdenPendienteDto>> {
+    let dto = state.generar_plan_para_prospecto(prospecto_id).await?;
+    Ok(Json(dto))
 }
 
 async fn handler_gatekeeper_pendientes(

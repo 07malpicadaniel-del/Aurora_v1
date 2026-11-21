@@ -46,13 +46,26 @@ async fn flujo_http_completo_hunt_gatekeeper_factory_pulse_dpo_y_opt_out(
     let (base_url, server_handle) = levantar_servidor_efimero(&base_dir).await?;
     let client = Client::new();
 
-    // 1. Health inicial
+    // 1. Health inicial + DPO idempotente sin eventos
     let health_resp = client.get(format!("{base_url}/api/v1/health")).send().await?;
     assert_eq!(health_resp.status(), StatusCode::OK);
     let health: HealthResponse = health_resp.json().await?;
     assert_eq!(health.status, "ok");
     assert!(health.bob_online);
     assert_eq!(health.nodos_4d, 0);
+
+    let dpo_vacio_resp = client
+        .post(format!("{base_url}/api/v1/dpo/consolidar"))
+        .send()
+        .await?;
+    assert_eq!(dpo_vacio_resp.status(), StatusCode::OK);
+    let dpo_vacio: DpoConsolidarResponse = dpo_vacio_resp.json().await?;
+    assert!(dpo_vacio.modo_noop);
+    assert_eq!(dpo_vacio.campanas_auditadas, 0);
+    assert_eq!(
+        dpo_vacio.mensaje,
+        "Sin eventos de telemetría nuevos para consolidar"
+    );
 
     // 2. Lanzar cacería OSINT con 2 prospectos co-mencionados -> ingestión 4D -> Córtex BOB -> Gatekeeper
     let ahora = Utc::now();
@@ -224,6 +237,27 @@ async fn flujo_http_completo_hunt_gatekeeper_factory_pulse_dpo_y_opt_out(
         .json()
         .await?;
     assert_eq!(gk_post.total_pendientes, 0);
+
+    // 6b. Generar una nueva orden directa para prospecto existente desde Telaraña 4D
+    let gen_resp = client
+        .post(format!(
+            "{base_url}/api/v1/cortex/generar-plan/{primer_prospecto}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(gen_resp.status(), StatusCode::OK);
+    let nueva_orden: OrdenPendienteDto = gen_resp.json().await?;
+    assert_eq!(nueva_orden.prospecto_id, primer_prospecto);
+    assert_eq!(nueva_orden.estado, EstadoAprobacion::PendienteGatekeeper);
+    assert_ne!(nueva_orden.orden_id, orden_aprobar.orden_id);
+
+    let gk_regen: GatekeeperPendientesResponse = client
+        .get(format!("{base_url}/api/v1/gatekeeper/pendientes"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(gk_regen.total_pendientes, 1);
 
     // 7. Consultar /api/v1/pulse/estado e inyectar telemetría contrastante para consolidación DPO
     let pulse_resp = client

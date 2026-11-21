@@ -22,7 +22,7 @@ pub use dispatcher::{
 };
 pub use dpo_loop::{
     ConfigConsolidacionNocturna, DatasetPreferenciasDpo, EntradaPreferenciaDpo,
-    MotorConsolidacionNocturna,
+    MotorConsolidacionNocturna, ReporteConsolidacionDpo,
 };
 pub use error::{PulseError, PulseResult};
 pub use rate_limiter::{
