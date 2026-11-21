@@ -527,6 +527,21 @@ async fn cliente_http_bob_envia_gramatica_gbnf_y_slot_unico_local(
         if !gramatica_recibida.contains("root ::=") {
             return Err("el request HTTP a BOB no incluyo gramatica GBNF".to_string());
         }
+        let thinking_flag = req_json
+            .get("chat_template_kwargs")
+            .and_then(|k| k.get("enable_thinking"))
+            .and_then(serde_json::Value::as_bool);
+        if thinking_flag != Some(false) {
+            return Err("chat_template_kwargs.enable_thinking esperado = false".to_string());
+        }
+        let prompt_enviado = req_json
+            .get("prompt")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if !prompt_enviado.contains("/no_think") || !prompt_enviado.ends_with("<think>\n</think>\n")
+        {
+            return Err("el prompt GBNF no desactivo el bloque de pensamiento interno".to_string());
+        }
 
         let diag_json = serde_json::to_string(&DiagnosticoComercial {
             prospecto_id,

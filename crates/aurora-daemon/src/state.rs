@@ -28,9 +28,10 @@ use aurora_memory::{
     VecinoCirculoCercano,
 };
 use aurora_osint::{
-    ConfigCdpFetcher, ConsultaObjetivo, DestiladorOsint, DynamicBrowserFetcher, EnjambreOsint,
-    EntityResolver, FormatoCrudo, HttpCdpBrowserFetcher, HttpSwarmClient, OsintError, OsintResult,
-    OsintSource, PipelineOsint, PoliticaHttp, RegistroCrudo, SenalesAbiertasAdapter,
+    ConfigCdpFetcher, ConsultaObjetivo, DenueInegiAdapter, DestiladorOsint, DynamicBrowserFetcher,
+    EnjambreOsint, EntityResolver, FormatoCrudo, HttpCdpBrowserFetcher, HttpSwarmClient,
+    OsintError, OsintResult, OsintSource, PipelineOsint, PoliticaHttp, RegistroCrudo,
+    SenalesAbiertasAdapter, WebPublicaMxAdapter,
 };
 use aurora_pulse::{
     ChannelTransport, ComprobanteDespacho, ConfigCalentamiento, ConfigConsolidacionNocturna,
@@ -57,6 +58,7 @@ use crate::config::{
     SubsystemProbe,
 };
 use crate::error::{DaemonError, DaemonResult};
+use crate::scheduler::EstadoSchedulerDpo;
 
 /// Envoltorio object-safe para conectar cualquier [`BobInferenceBackend`] con el daemon sin genéricos en router.
 #[derive(Clone)]
@@ -488,6 +490,9 @@ pub struct PulseEstadoResponse {
     pub calentamientos_recientes: Vec<RegistroInteraccion>,
     /// Despachos multicanal completados recientes.
     pub despachos_recientes: Vec<ComprobanteDespacho>,
+    /// Estado del scheduler circadiano autónomo DPO en segundo plano.
+    #[serde(default)]
+    pub scheduler_dpo: EstadoSchedulerDpo,
 }
 
 /// Respuesta de `POST /api/v1/dpo/consolidar`.
@@ -561,6 +566,7 @@ pub struct AuroraDaemonState {
     cdp_fetcher: Option<Arc<HttpCdpBrowserFetcher>>,
     memoria: RwLock<MotorMemoriaAurora>,
     osint_fuentes: RwLock<Vec<Arc<dyn OsintSource>>>,
+    bob_slot_lock: Arc<tokio::sync::Mutex<()>>,
     orquestador: OrquestadorComercialBob<DynBobBackend>,
     fabrica: FabricaMultimodalAurora<DynTtsEngine, DynDocumentEngine, DynVideoComposer>,
     rate_limiter: Arc<ControladorTasaPlataforma>,
@@ -568,6 +574,7 @@ pub struct AuroraDaemonState {
     despachador: DespachadorMulticanal<DynChannelTransport>,
     telemetria: Arc<RecolectorTelemetria>,
     motor_dpo: MotorConsolidacionNocturna<DynBobBackend>,
+    scheduler_estado: Mutex<EstadoSchedulerDpo>,
     cola_gatekeeper: Mutex<BTreeMap<Uuid, RegistroOrdenInterno>>,
     calentamientos_recientes: Mutex<Vec<RegistroInteraccion>>,
     despachos_recientes: Mutex<Vec<ComprobanteDespacho>>,
@@ -718,6 +725,8 @@ impl AuroraDaemonState {
             data_dir: base_dir.to_path_buf(),
             modo_offline: true,
             modo_ejecucion: ModoEjecucion::SimuladoOffline,
+            osint_web_publica_habilitada: false,
+            dpo_scheduler_habilitado: false,
             ..AuroraDaemonConfig::default()
         };
 
@@ -808,6 +817,15 @@ impl AuroraDaemonState {
         };
 
         let (eventos_tx, _) = broadcast::channel(256);
+        let scheduler_inicial = EstadoSchedulerDpo {
+            habilitado: config.dpo_scheduler_habilitado,
+            hora_utc_preferida: config.dpo_hora_utc,
+            intervalo_minutos: config.dpo_intervalo_minutos,
+            proxima_ejecucion: None,
+            ultima_ejecucion: None,
+            ciclos_completados: 0,
+            ultimo_resultado: None,
+        };
 
         Ok(Arc::new(Self {
             config,
@@ -816,6 +834,7 @@ impl AuroraDaemonState {
             cdp_fetcher,
             memoria: RwLock::new(memoria),
             osint_fuentes: RwLock::new(fuentes_iniciales),
+            bob_slot_lock: Arc::new(tokio::sync::Mutex::new(())),
             orquestador,
             fabrica,
             rate_limiter,
@@ -823,12 +842,40 @@ impl AuroraDaemonState {
             despachador,
             telemetria: Arc::new(RecolectorTelemetria::new()),
             motor_dpo,
+            scheduler_estado: Mutex::new(scheduler_inicial),
             cola_gatekeeper: Mutex::new(cola_inicial),
             calentamientos_recientes: Mutex::new(Vec::new()),
             despachos_recientes: Mutex::new(Vec::new()),
             ruta_cola_persistida,
             eventos_tx,
         }))
+    }
+
+    /// Devuelve la configuración activa del demonio.
+    #[must_use]
+    pub const fn config(&self) -> &AuroraDaemonConfig {
+        &self.config
+    }
+
+    /// Devuelve el mutex exclusivo que protege `slot_id = 0` de BOB en VRAM.
+    #[must_use]
+    pub fn bob_slot_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(&self.bob_slot_lock)
+    }
+
+    /// Devuelve una instantánea del estado actual del scheduler circadiano DPO.
+    #[must_use]
+    pub fn estado_scheduler_dpo(&self) -> EstadoSchedulerDpo {
+        self.scheduler_estado.lock().clone()
+    }
+
+    /// Actualiza atómicamente los metadatos visibles del scheduler circadiano DPO.
+    pub fn actualizar_estado_scheduler<F>(&self, f: F)
+    where
+        F: FnOnce(&mut EstadoSchedulerDpo),
+    {
+        let mut guard = self.scheduler_estado.lock();
+        f(&mut guard);
     }
 
     /// Devuelve referencia al recolector de telemetría (para integración o pruebas).
@@ -1008,6 +1055,30 @@ impl AuroraDaemonState {
             }
         }
 
+        if !tiene_fuente && !matches!(self.config.modo_efectivo(), ModoEjecucion::SimuladoOffline) {
+            let http_mx = HttpSwarmClient::new(PoliticaHttp::default())?;
+            if let Some(ref token) = self.config.inegi_token {
+                let denue = DenueInegiAdapter::new(Some(token.clone()), http_mx.clone());
+                if denue.tiene_token() {
+                    enjambre.registrar_fuente(Arc::new(denue));
+                    tiene_fuente = true;
+                }
+            }
+            if self.config.osint_web_publica_habilitada {
+                let web_mx = if self.config.osint_web_publica_urls.is_empty() {
+                    WebPublicaMxAdapter::new(http_mx)
+                } else {
+                    WebPublicaMxAdapter::con_urls(
+                        "WebPublicaMX",
+                        self.config.osint_web_publica_urls.clone(),
+                        http_mx,
+                    )
+                };
+                enjambre.registrar_fuente(Arc::new(web_mx));
+                tiene_fuente = true;
+            }
+        }
+
         if !tiene_fuente {
             return Err(DaemonError::SolicitudInvalida(
                 "no hay fuentes OSINT configuradas; proporciona 'fuente_url' HTTP/HTTPS o 'registros_semilla'"
@@ -1048,25 +1119,24 @@ impl AuroraDaemonState {
         let mut planes_encolados = Vec::new();
         let ahora = Utc::now();
 
-        {
+        for prospecto in &ids_objetivo {
+            let _slot_guard = self.bob_slot_lock.lock().await;
             let mem = self.memoria.read().await;
-            for prospecto in &ids_objetivo {
-                if mem.esta_en_blacklist(prospecto.id) {
+            if mem.esta_en_blacklist(prospecto.id) {
+                continue;
+            }
+            let subgrafo = match construir_subgrafo_por_uuid(&mem, prospecto.id, ahora) {
+                Ok(sg) => sg,
+                Err(err) => {
+                    warn!(prospecto_id = %prospecto.id, error = %err, "Omitiendo prospecto sin subgrafo");
                     continue;
                 }
-                let subgrafo = match construir_subgrafo_por_uuid(&mem, prospecto.id, ahora) {
-                    Ok(sg) => sg,
-                    Err(err) => {
-                        warn!(prospecto_id = %prospecto.id, error = %err, "Omitiendo prospecto sin subgrafo");
-                        continue;
-                    }
-                };
+            };
 
-                let registro = self
-                    .construir_registro_orden(&mem, &subgrafo, campana_id)
-                    .await?;
-                planes_encolados.push(registro);
-            }
+            let registro = self
+                .construir_registro_orden(&mem, &subgrafo, campana_id)
+                .await?;
+            planes_encolados.push(registro);
         }
 
         let dtos = self.encolar_registros_gatekeeper(planes_encolados)?;
@@ -1102,6 +1172,7 @@ impl AuroraDaemonState {
         let ahora = Utc::now();
 
         let registro = {
+            let _slot_guard = self.bob_slot_lock.lock().await;
             let mem = self.memoria.read().await;
             if mem.esta_en_blacklist(prospecto_id) {
                 return Err(DaemonError::OptOutActivo(prospecto_id));
@@ -1595,6 +1666,7 @@ impl AuroraDaemonState {
             telemetria_eventos_totales: self.telemetria.total_eventos(),
             calentamientos_recientes,
             despachos_recientes,
+            scheduler_dpo: self.estado_scheduler_dpo(),
         }
     }
 
@@ -1613,10 +1685,12 @@ impl AuroraDaemonState {
         Ok(self.telemetria.registrar_evento(evento)?)
     }
 
-    /// Ejecuta un ciclo de consolidación nocturna DPO y recalibra el `GrafoTemporal4D`.
+    /// Ejecuta un ciclo de consolidación nocturna DPO y recalibra el `GrafoTemporal4D`,
+    /// protegiendo el `slot_id = 0` de BOB mediante exclusión mutua asíncrona.
     #[tracing::instrument(skip(self))]
     pub async fn consolidar_dpo(&self) -> DaemonResult<DpoConsolidarResponse> {
         let dataset = {
+            let _slot_guard = self.bob_slot_lock.lock().await;
             let mut mem = self.memoria.write().await;
             self.motor_dpo
                 .consolidar(&self.telemetria, &mut mem)
@@ -1641,6 +1715,17 @@ impl AuroraDaemonState {
             mensaje: dataset.mensaje.clone(),
             dataset,
         })
+    }
+
+    /// Ejecuta una corrida del scheduler nocturno DPO y actualiza sus contadores observables.
+    pub async fn ejecutar_ciclo_scheduler_dpo(&self) -> DaemonResult<DpoConsolidarResponse> {
+        let resp = self.consolidar_dpo().await?;
+        self.actualizar_estado_scheduler(|est| {
+            est.ultima_ejecucion = Some(Utc::now());
+            est.ciclos_completados = est.ciclos_completados.saturating_add(1);
+            est.ultimo_resultado = Some(resp.mensaje.clone());
+        });
+        Ok(resp)
     }
 
     fn emitir_evento(&self, tipo: &str, payload: serde_json::Value) {

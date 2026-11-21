@@ -83,6 +83,18 @@ pub struct AuroraDaemonConfig {
     pub ffmpeg_bin: PathBuf,
     /// Prioriza codificación hardware `h264_nvenc` (RTX 5060 Ti) con respaldo `libx264` CPU.
     pub usar_nvenc: bool,
+    /// Token oficial de la API pública DENUE / INEGI (`AURORA_INEGI_TOKEN`); opcional.
+    pub inegi_token: Option<String>,
+    /// Habilita el adaptador web público mexicano (`WebPublicaMxAdapter`) sin API key.
+    pub osint_web_publica_habilitada: bool,
+    /// URLs públicas opcionales personalizadas para `WebPublicaMxAdapter`.
+    pub osint_web_publica_urls: Vec<String>,
+    /// Activa el scheduler circadiano autónomo DPO en segundo plano.
+    pub dpo_scheduler_habilitado: bool,
+    /// Hora UTC preferida para anclar ciclos DPO (`0..=23`, por defecto `9` = `03:00 CST`).
+    pub dpo_hora_utc: u8,
+    /// Intervalo entre ciclos DPO en minutos (por defecto `360` = cada 6 horas).
+    pub dpo_intervalo_minutos: u64,
     /// Configuración SMTP (`lettre` + `tokio1-rustls-tls`) y cumplimiento LFPDPPP `List-Unsubscribe`.
     pub smtp: ConfigSmtp,
 }
@@ -107,6 +119,12 @@ impl Default for AuroraDaemonConfig {
             cdp_url: "http://127.0.0.1:9222".to_string(),
             ffmpeg_bin: PathBuf::from("ffmpeg"),
             usar_nvenc: true,
+            inegi_token: None,
+            osint_web_publica_habilitada: true,
+            osint_web_publica_urls: Vec::new(),
+            dpo_scheduler_habilitado: true,
+            dpo_hora_utc: 9,
+            dpo_intervalo_minutos: 360,
             smtp: ConfigSmtp::default(),
         }
     }
@@ -291,6 +309,31 @@ impl AuroraDaemonConfig {
         if let Some(v) = leer_env("AURORA_USAR_NVENC").filter(|s| !s.trim().is_empty()) {
             self.usar_nvenc = parsear_bool_env("AURORA_USAR_NVENC", &v)?;
         }
+        if let Some(v) = leer_env("AURORA_INEGI_TOKEN") {
+            let limpio = v.trim().to_string();
+            self.inegi_token = if limpio.is_empty() { None } else { Some(limpio) };
+        }
+        if let Some(v) = leer_env("AURORA_OSINT_WEB_PUBLICA").filter(|s| !s.trim().is_empty()) {
+            self.osint_web_publica_habilitada = parsear_bool_env("AURORA_OSINT_WEB_PUBLICA", &v)?;
+        }
+        if let Some(v) =
+            leer_env("AURORA_DPO_SCHEDULER_HABILITADO").filter(|s| !s.trim().is_empty())
+        {
+            self.dpo_scheduler_habilitado =
+                parsear_bool_env("AURORA_DPO_SCHEDULER_HABILITADO", &v)?;
+        }
+        if let Some(v) = leer_env("AURORA_DPO_HORA_UTC").filter(|s| !s.trim().is_empty()) {
+            self.dpo_hora_utc = v.trim().parse::<u8>().map_err(|e| {
+                DaemonError::Configuracion(format!("AURORA_DPO_HORA_UTC inválido ('{v}'): {e}"))
+            })?;
+        }
+        if let Some(v) = leer_env("AURORA_DPO_INTERVALO_MINUTOS").filter(|s| !s.trim().is_empty()) {
+            self.dpo_intervalo_minutos = v.trim().parse::<u64>().map_err(|e| {
+                DaemonError::Configuracion(format!(
+                    "AURORA_DPO_INTERVALO_MINUTOS inválido ('{v}'): {e}"
+                ))
+            })?;
+        }
         if let Some(v) = leer_env("AURORA_MODO_EJECUCION").filter(|s| !s.trim().is_empty()) {
             let parsed = ModoEjecucion::desde_str(&v).ok_or_else(|| {
                 DaemonError::Configuracion(format!(
@@ -373,6 +416,23 @@ impl AuroraDaemonConfig {
                 "cdp_url '{}' debe iniciar con http:// o https://",
                 self.cdp_url
             )));
+        }
+        if self.dpo_hora_utc > 23 {
+            return Err(DaemonError::Configuracion(format!(
+                "dpo_hora_utc={} fuera de rango válido (0..=23)",
+                self.dpo_hora_utc
+            )));
+        }
+        if self.dpo_scheduler_habilitado && self.dpo_intervalo_minutos == 0 {
+            return Err(DaemonError::Configuracion(
+                "dpo_intervalo_minutos debe ser >= 1 cuando dpo_scheduler_habilitado = true"
+                    .to_string(),
+            ));
+        }
+        if let Some(ref t) = self.inegi_token {
+            if t.trim().is_empty() {
+                self.inegi_token = None;
+            }
         }
         if self.modo_offline {
             self.modo_ejecucion = ModoEjecucion::SimuladoOffline;
@@ -953,6 +1013,31 @@ remitente_correo = "comercial@inmobiliaria-aurora.mx"
         let env_off = HashMap::from([("AURORA_OFFLINE_MOCK", "1".to_string())]);
         let cfg = AuroraDaemonConfig::cargar_con_lector_entorno(None, |k| env_off.get(k).cloned())?;
         assert_eq!(cfg.modo_efectivo(), ModoEjecucion::SimuladoOffline);
+
+        let env_dpo = HashMap::from([
+            ("AURORA_INEGI_TOKEN", "token-inegi-mx".to_string()),
+            ("AURORA_DPO_SCHEDULER_HABILITADO", "true".to_string()),
+            ("AURORA_DPO_HORA_UTC", "4".to_string()),
+            ("AURORA_DPO_INTERVALO_MINUTOS", "180".to_string()),
+        ]);
+        let cfg_dpo =
+            AuroraDaemonConfig::cargar_con_lector_entorno(None, |k| env_dpo.get(k).cloned())?;
+        assert_eq!(cfg_dpo.inegi_token.as_deref(), Some("token-inegi-mx"));
+        assert!(cfg_dpo.dpo_scheduler_habilitado);
+        assert_eq!(cfg_dpo.dpo_hora_utc, 4);
+        assert_eq!(cfg_dpo.dpo_intervalo_minutos, 180);
+
+        let env_bad_hour = HashMap::from([("AURORA_DPO_HORA_UTC", "25".to_string())]);
+        assert!(AuroraDaemonConfig::cargar_con_lector_entorno(None, |k| {
+            env_bad_hour.get(k).cloned()
+        })
+        .is_err());
+
+        let env_bad_interval = HashMap::from([("AURORA_DPO_INTERVALO_MINUTOS", "0".to_string())]);
+        assert!(AuroraDaemonConfig::cargar_con_lector_entorno(None, |k| {
+            env_bad_interval.get(k).cloned()
+        })
+        .is_err());
         Ok(())
     }
 }

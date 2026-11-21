@@ -1,7 +1,9 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use aurora_daemon::{crear_router, AuroraDaemonConfig, AuroraDaemonState, ModoEjecucion};
+use aurora_daemon::{
+    crear_router, iniciar_scheduler_dpo, AuroraDaemonConfig, AuroraDaemonState, ModoEjecucion,
+};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -68,6 +70,7 @@ async fn main() -> ExitCode {
         "aurora-daemon escuchando para Cockpit axis_v1 y automatizaciones locales"
     );
 
+    let scheduler_handle = iniciar_scheduler_dpo(Arc::clone(&state));
     let state_shutdown = Arc::clone(&state);
     let router = crear_router(state);
     if let Err(err) = axum::serve(listener, router)
@@ -75,11 +78,14 @@ async fn main() -> ExitCode {
         .await
     {
         error!(error = %err, "Error ejecutando servidor HTTP axum");
+        scheduler_handle.detener_y_esperar().await;
         if let Err(shutdown_err) = state_shutdown.apagar_ordenadamente().await {
             error!(error = %shutdown_err, "Error compactando WAL tras fallo de servidor");
         }
         return ExitCode::FAILURE;
     }
+
+    scheduler_handle.detener_y_esperar().await;
 
     if let Err(err) = state_shutdown.apagar_ordenadamente().await {
         error!(error = %err, "Error durante apagado ordenado (flush/compactación WAL)");

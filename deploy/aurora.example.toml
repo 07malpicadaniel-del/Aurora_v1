@@ -4,9 +4,9 @@
 # Dirección HTTP/WebSocket/SSE local consumida por el Cockpit axis_v1
 bind_addr = "127.0.0.1:8090"
 
-# Endpoint único del modelo residente en RTX 5060 Ti (Qwen 3.8 27B, slot_id = 0 obligatorio)
+# Endpoint único del modelo residente en RTX 5060 Ti (Qwen 27B IQ3_S imatrix, slot_id = 0 obligatorio)
 # Diagnóstico rápido de conectividad e inferencia GBNF: `cargo run -p aurora-daemon --bin aurora-smoke`
-bob_url = "http://127.0.0.1:8085"
+bob_url = "http://127.0.0.1:8086"
 bob_slot_id = 0
 
 # Rutas XDG en NVMe local (~ se expande a $HOME)
@@ -22,6 +22,18 @@ data_dir = "~/.local/share/aurora"
 # - "simulado_offline": adaptadores deterministas en memoria para CI/pruebas
 modo_ejecucion = "real_con_fallback"
 modo_offline = false
+
+# Conectores OSINT reales de México (LFPDPPP estricto sobre fuentes públicas)
+# Token gratuito oficial DENUE / INEGI (o vía env AURORA_INEGI_TOKEN); si se omite, se salta sin error
+# inegi_token = ""
+osint_web_publica_habilitada = true
+# Opcional: lista personalizada de directorios/portales corporativos públicos de México
+# osint_web_publica_urls = []
+
+# Scheduler circadiano autónomo DPO (respeta exclusividad slot_id = 0 de BOB)
+dpo_scheduler_habilitado = true
+dpo_hora_utc = 9
+dpo_intervalo_minutos = 360
 
 # Locución neuronal en CPU/RAM (Ryzen 9, 0 MB VRAM)
 piper_bin = "piper"

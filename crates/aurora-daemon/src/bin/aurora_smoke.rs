@@ -21,7 +21,8 @@ use chrono::Utc;
 use reqwest::Client;
 use uuid::Uuid;
 
-const MODELO_PREFERIDO_DEFAULT: &str = "gemma-3-12b-it-Q4_K_M.gguf (12B Q4_K_M VRAM<=12GB) / Qwen3.8-27B";
+const MODELO_PREFERIDO_DEFAULT: &str =
+    "Qwen3.8-27B-UD-IQ3_S.gguf (Qwen 27B IQ3_S imatrix, VRAM<=14.5GB)";
 
 async fn consultar_modelo_activo_bob(http_client: &Client, bob_url: &str) -> Option<String> {
     let url = format!("{}/props", bob_url.trim_end_matches('/'));
@@ -84,15 +85,18 @@ async fn main() -> ExitCode {
 
     if !reporte.bob_llm.modo_real_activo {
         println!("[INFO] BOB LLM no responde en {}. Smoke test completado sin inferencia.", config.bob_url);
-        println!("       Para encender BOB (techo <= 12.5 GB VRAM) en Arch Linux:");
+        println!("       Para encender BOB (Qwen 27B IQ3_S imatrix) en Arch Linux:");
         println!();
-        println!("       llama-server -m models/gemma-2-9b-it-abliterated-Q4_K_M.gguf \\");
-        println!("         --host 127.0.0.1 --port 8085 -ngl 99 -np 1 -c 8192 -b 512 -ctk q8_0 -ctv q8_0 -fa on");
+        println!("       llama-server -m models/Qwen3.8-27B-UD-IQ3_S.gguf \\");
+        println!("         --host 127.0.0.1 --port 8086 -ngl 99 -np 1 -c 8192 -b 512 -ctk q8_0 -ctv q8_0 -fa on");
         return ExitCode::SUCCESS;
     }
 
     if let Some(modelo_activo) = consultar_modelo_activo_bob(&http_client, &config.bob_url).await {
-        println!("Modelo activo en BOB (:8085 /props): {modelo_activo}");
+        println!(
+            "Modelo activo en BOB ({}/props): {modelo_activo}",
+            config.bob_url.trim_end_matches('/')
+        );
     }
 
     println!(

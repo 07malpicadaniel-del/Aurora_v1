@@ -22,7 +22,8 @@ pub use error::{OsintError, OsintResult};
 pub use pipeline::{PipelineOsint, ResultadoIngestaOsint};
 pub use resolver::{EntidadResuelta, EntityResolver};
 pub use sources::{
-    CoMencionCruda, ConsultaObjetivo, DirectorioPublicoAdapter, DynamicBrowserFetcher,
-    EnjambreOsint, FormatoCrudo, HttpSwarmClient, OsintSource, PoliticaHttp, RegistroCrudo,
-    SenalesAbiertasAdapter,
+    clave_entidad_inegi, CoMencionCruda, ConsultaObjetivo, DenueInegiAdapter,
+    DirectorioPublicoAdapter, DynamicBrowserFetcher, EnjambreOsint, FormatoCrudo, HttpSwarmClient,
+    OsintSource, PoliticaHttp, RegistroCrudo, RegistroDenueInegi, SenalesAbiertasAdapter,
+    WebPublicaMxAdapter, DENUE_API_BASE_DEFAULT,
 };

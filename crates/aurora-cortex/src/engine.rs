@@ -74,6 +74,11 @@ impl Default for ConfigHttpBob {
 }
 
 #[derive(Debug, Serialize)]
+struct ChatTemplateKwargs {
+    enable_thinking: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct LlamaCompletionPayload<'a> {
     prompt: String,
     n_predict: u32,
@@ -82,7 +87,11 @@ struct LlamaCompletionPayload<'a> {
     cache_prompt: bool,
     stream: bool,
     grammar: &'a str,
+    stop: &'static [&'static str],
+    chat_template_kwargs: ChatTemplateKwargs,
 }
+
+const STOP_TOKENS_GBNF: &[&str] = &["<|im_end|>", "<|endoftext|>", "<end_of_turn>", "<eos>"];
 
 #[derive(Debug, Deserialize)]
 struct LlamaCompletionResponse {
@@ -135,7 +144,7 @@ impl HttpBobCortexClient {
 
     fn construir_prompt_completo(rol: RolCognitivo, contexto_usuario: &str) -> String {
         format!(
-            "<|im_start|>system\n{}\n<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n<|im_start|>assistant\n",
+            "<|im_start|>system\n{}\n<|im_end|>\n<|im_start|>user\n{}\n/no_think<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n",
             rol.system_prompt(),
             contexto_usuario.trim()
         )
@@ -172,6 +181,10 @@ impl BobInferenceBackend for HttpBobCortexClient {
             cache_prompt: self.config.cache_prompt,
             stream: false,
             grammar: gramatica_gbnf,
+            stop: STOP_TOKENS_GBNF,
+            chat_template_kwargs: ChatTemplateKwargs {
+                enable_thinking: false,
+            },
         };
 
         let total_intentos = self.config.max_reintentos.saturating_add(1);
@@ -293,6 +306,16 @@ mod qwen_tests {
         let gemma_fin = "{\"ok\":true}<end_of_turn><eos>";
         assert_eq!(limpiar_salida_qwen(gemma_fin), "{\"ok\":true}");
         assert_eq!(ConfigHttpBob::default().timeout_ms, 60_000);
+    }
+
+    #[test]
+    fn prompt_gbnf_desactiva_pensamiento_interno_para_qwen() {
+        let prompt = HttpBobCortexClient::construir_prompt_completo(
+            RolCognitivo::Perfilador,
+            "Prospecto industrial Monterrey",
+        );
+        assert!(prompt.contains("/no_think<|im_end|>"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n</think>\n"));
     }
 }
 

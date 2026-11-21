@@ -2,6 +2,7 @@ pub mod adapters;
 pub mod config;
 pub mod error;
 pub mod routes;
+pub mod scheduler;
 pub mod state;
 
 pub use config::{
@@ -10,6 +11,10 @@ pub use config::{
 };
 pub use error::{DaemonError, DaemonResult};
 pub use routes::crear_router;
+pub use scheduler::{
+    calcular_proxima_ejecucion, iniciar_scheduler_dpo, iniciar_scheduler_dpo_con_intervalo,
+    EstadoSchedulerDpo, SchedulerDpoHandle,
+};
 pub use state::{
     AprobarOrdenRequest, AprobarOrdenResponse, AristaTelaranaDto, AuroraDaemonState, DaemonConfig,
     DpoConsolidarResponse, EventoDaemon, GatekeeperPendientesResponse, GatilloTelaranaDto,

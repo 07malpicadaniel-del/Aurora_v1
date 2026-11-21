@@ -842,6 +842,991 @@ impl OsintSource for SenalesAbiertasAdapter {
     }
 }
 
+/// Endpoint oficial de la API pública DENUE del INEGI para consultas por entidad federativa.
+pub const DENUE_API_BASE_DEFAULT: &str =
+    "https://www.inegi.org.mx/app/api/denue/v1/consulta/BuscarEntidad";
+
+/// Registro devuelto por la API JSON oficial del DENUE (INEGI México).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RegistroDenueInegi {
+    /// Clave Estadística de Establecimiento (identificador único oficial INEGI).
+    #[serde(default, alias = "CLEE", alias = "clee")]
+    pub clee: Option<String>,
+    /// Identificador numérico del establecimiento en DENUE.
+    #[serde(default, alias = "Id", alias = "id")]
+    pub id: Option<String>,
+    /// Nombre comercial del establecimiento.
+    #[serde(default, alias = "Nombre", alias = "nombre")]
+    pub nombre: Option<String>,
+    /// Razón social registrada.
+    #[serde(default, alias = "Razon_social", alias = "razon_social")]
+    pub razon_social: Option<String>,
+    /// Descripción de clase de actividad económica SCIAN.
+    #[serde(default, alias = "Clase_actividad", alias = "clase_actividad")]
+    pub clase_actividad: Option<String>,
+    /// Estrato de personal ocupado (ej. `51 a 100 personas`, `251 y más personas`).
+    #[serde(default, alias = "Estrato", alias = "estrato")]
+    pub estrato: Option<String>,
+    /// Tipo de vialidad.
+    #[serde(default, alias = "Tipo_vialidad", alias = "tipo_vialidad")]
+    pub tipo_vialidad: Option<String>,
+    /// Nombre de la calle o avenida.
+    #[serde(default, alias = "Calle", alias = "calle")]
+    pub calle: Option<String>,
+    /// Número exterior.
+    #[serde(default, alias = "Num_Exterior", alias = "num_exterior")]
+    pub num_exterior: Option<String>,
+    /// Colonia o asentamiento.
+    #[serde(default, alias = "Colonia", alias = "colonia")]
+    pub colonia: Option<String>,
+    /// Código postal.
+    #[serde(default, alias = "CP", alias = "cp")]
+    pub cp: Option<String>,
+    /// Cadena `"LOCALIDAD, MUNICIPIO, ENTIDAD"` devuelta por INEGI.
+    #[serde(default, alias = "Ubicacion", alias = "ubicacion")]
+    pub ubicacion: Option<String>,
+    /// Teléfono público del establecimiento.
+    #[serde(default, alias = "Telefono", alias = "telefono")]
+    pub telefono: Option<String>,
+    /// Correo electrónico público del establecimiento.
+    #[serde(default, alias = "Correo_e", alias = "correo_e")]
+    pub correo_e: Option<String>,
+    /// Sitio web corporativo público.
+    #[serde(default, alias = "Sitio_internet", alias = "sitio_internet")]
+    pub sitio_internet: Option<String>,
+    /// Latitud geográfica.
+    #[serde(default, alias = "Latitud", alias = "latitud")]
+    pub latitud: Option<String>,
+    /// Longitud geográfica.
+    #[serde(default, alias = "Longitud", alias = "longitud")]
+    pub longitud: Option<String>,
+}
+
+/// Conector OSINT real contra la API pública del DENUE / INEGI de México (`reqwest` + `rustls-tls`).
+///
+/// Si el token (`AURORA_INEGI_TOKEN`) no está configurado, omite la recolección limpiamente
+/// devolviendo `Ok(Vec::new())` sin interrumpir el resto del enjambre.
+pub struct DenueInegiAdapter {
+    token: Option<String>,
+    api_base: String,
+    http: HttpSwarmClient,
+    fixture_inline: Option<String>,
+}
+
+impl DenueInegiAdapter {
+    /// Construye el conector oficial contra `www.inegi.org.mx`.
+    #[must_use]
+    pub fn new(token: Option<String>, http: HttpSwarmClient) -> Self {
+        Self::con_api_base(token, DENUE_API_BASE_DEFAULT, http)
+    }
+
+    /// Construye el conector apuntando a una URL base personalizable (útil para servidores mock locales).
+    #[must_use]
+    pub fn con_api_base(
+        token: Option<String>,
+        api_base: impl Into<String>,
+        http: HttpSwarmClient,
+    ) -> Self {
+        let token_limpio = token
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        Self {
+            token: token_limpio,
+            api_base: api_base.into().trim_end_matches('/').to_string(),
+            http,
+            fixture_inline: None,
+        }
+    }
+
+    /// Construye un adaptador offline determinista a partir de un fixture JSON oficial de DENUE.
+    #[must_use]
+    pub fn desde_fixture(raw_json: impl Into<String>, http: HttpSwarmClient) -> Self {
+        Self {
+            token: Some("fixture-offline".to_string()),
+            api_base: DENUE_API_BASE_DEFAULT.to_string(),
+            http,
+            fixture_inline: Some(raw_json.into()),
+        }
+    }
+
+    /// Indica si el adaptador cuenta con token configurado para consultar INEGI.
+    #[must_use]
+    pub fn tiene_token(&self) -> bool {
+        self.token.is_some()
+    }
+
+    /// Construye la URL oficial `BuscarEntidad/{condicion}/{entidad}/1/{limite}/{token}`.
+    #[must_use]
+    pub fn construir_url_consulta(
+        &self,
+        condicion: &str,
+        entidad: &str,
+        limite: usize,
+        token: &str,
+    ) -> String {
+        let cond_encoded = percent_encode_segment(condicion);
+        let reg_final = limite.clamp(1, 50);
+        format!(
+            "{}/{}/{}/1/{}/{}",
+            self.api_base, cond_encoded, entidad, reg_final, token
+        )
+    }
+
+    /// Mapea las palabras clave y vertical comercial hacia condiciones de búsqueda DENUE.
+    #[must_use]
+    pub fn condiciones_para_consulta(consulta: &ConsultaObjetivo) -> Vec<String> {
+        use aurora_domain::{SubverticalInmobiliaria, SubverticalSeguros};
+
+        let mut condiciones: Vec<String> = consulta
+            .palabras_clave
+            .iter()
+            .map(|k| k.trim())
+            .filter(|k| k.len() >= 3)
+            .take(2)
+            .map(str::to_string)
+            .collect();
+
+        let defaults: &[&str] = match consulta.vertical {
+            VerticalComercial::Inmobiliaria(SubverticalInmobiliaria::ComercialIndustrial) => {
+                &["parque industrial", "constructora", "logistica"]
+            }
+            VerticalComercial::Inmobiliaria(
+                SubverticalInmobiliaria::Preventa | SubverticalInmobiliaria::Residencial,
+            ) => &["inmobiliaria", "constructora"],
+            VerticalComercial::Seguros(SubverticalSeguros::Gmm | SubverticalSeguros::Vida) => {
+                &["clinica", "hospital"]
+            }
+            VerticalComercial::Seguros(
+                SubverticalSeguros::HombreClave
+                | SubverticalSeguros::Educativo
+                | SubverticalSeguros::Patrimonial,
+            ) => &["logistica", "constructora", "clinica"],
+        };
+
+        for term in defaults {
+            if condiciones.len() >= 3 {
+                break;
+            }
+            if !condiciones
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case(term))
+            {
+                condiciones.push((*term).to_string());
+            }
+        }
+
+        if condiciones.is_empty() {
+            condiciones.push("inmobiliaria".to_string());
+        }
+        condiciones
+    }
+
+    /// Parsea la respuesta JSON oficial de INEGI-DENUE hacia registros crudos trazables (LFPDPPP).
+    pub fn parsear_respuesta_denue(
+        raw_json: &str,
+        consulta: &ConsultaObjetivo,
+        ahora: DateTime<Utc>,
+    ) -> OsintResult<Vec<RegistroCrudo>> {
+        let trimmed = raw_json.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("\"No hay resultados.\"")
+            || trimmed.eq_ignore_ascii_case("No hay resultados.")
+        {
+            return Ok(Vec::new());
+        }
+
+        let items: Vec<RegistroDenueInegi> =
+            serde_json::from_str(trimmed).map_err(|e| OsintError::ParseoJson {
+                fuente: "INEGI-DENUE".to_string(),
+                source: e,
+            })?;
+
+        let mut registros = Vec::with_capacity(items.len());
+        for item in items {
+            let nombre_comercial = limpiar_opcional(item.nombre.as_deref());
+            let razon_social = limpiar_opcional(item.razon_social.as_deref());
+            let empresa = razon_social.clone().or_else(|| nombre_comercial.clone());
+            let Some(empresa_texto) = empresa.clone() else {
+                continue;
+            };
+
+            let clee = limpiar_opcional(item.clee.as_deref());
+            let denue_id = limpiar_opcional(item.id.as_deref());
+            let giro = limpiar_opcional(item.clase_actividad.as_deref())
+                .unwrap_or_else(|| "Actividad empresarial registrada en DENUE".to_string());
+            let estrato = limpiar_opcional(item.estrato.as_deref())
+                .unwrap_or_else(|| "Estrato no especificado".to_string());
+            let colonia = limpiar_opcional(item.colonia.as_deref());
+            let ubicacion = parsear_ubicacion_denue(
+                item.ubicacion.as_deref(),
+                colonia.clone(),
+                &consulta.ubicacion,
+            );
+
+            let url_evidencia = if let Some(ref c) = clee {
+                format!(
+                    "https://www.inegi.org.mx/app/mapa/denue/default.aspx?clee={}",
+                    percent_encode_segment(c)
+                )
+            } else if let Some(ref id) = denue_id {
+                format!(
+                    "https://www.inegi.org.mx/app/mapa/denue/default.aspx?id={}",
+                    percent_encode_segment(id)
+                )
+            } else {
+                "https://www.inegi.org.mx/app/mapa/denue/".to_string()
+            };
+
+            let mut datos_extra = BTreeMap::new();
+            datos_extra.insert("giro".to_string(), giro.clone());
+            datos_extra.insert("estrato".to_string(), estrato.clone());
+            if let Some(ref c) = clee {
+                datos_extra.insert("clee".to_string(), c.clone());
+            }
+            if let Some(ref id) = denue_id {
+                datos_extra.insert("denue_id".to_string(), id.clone());
+            }
+            if let Some(correo) = limpiar_opcional(item.correo_e.as_deref()) {
+                datos_extra.insert("correo".to_string(), correo);
+            }
+            if let Some(tel) = limpiar_opcional(item.telefono.as_deref()) {
+                datos_extra.insert("telefono".to_string(), tel);
+            }
+            if let Some(web) = limpiar_opcional(item.sitio_internet.as_deref()) {
+                datos_extra.insert("sitio_web".to_string(), web);
+            }
+            if let Some(cp) = limpiar_opcional(item.cp.as_deref()) {
+                datos_extra.insert("codigo_postal".to_string(), cp);
+            }
+            if let Some(lat) = limpiar_opcional(item.latitud.as_deref()) {
+                datos_extra.insert("latitud".to_string(), lat);
+            }
+            if let Some(lon) = limpiar_opcional(item.longitud.as_deref()) {
+                datos_extra.insert("longitud".to_string(), lon);
+            }
+
+            let direccion = [
+                limpiar_opcional(item.tipo_vialidad.as_deref()),
+                limpiar_opcional(item.calle.as_deref()),
+                limpiar_opcional(item.num_exterior.as_deref()),
+                colonia,
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+            let nombre_detectado = nombre_comercial
+                .filter(|n| !n.eq_ignore_ascii_case(&empresa_texto))
+                .unwrap_or_else(|| format!("Dirección General {}", empresa_texto));
+
+            let contenido_crudo = format!(
+                "{} ({}) | Giro SCIAN: {} | Personal ocupado: {} | Ubicación: {}, {} {} | Registro público INEGI-DENUE.",
+                empresa_texto,
+                nombre_detectado,
+                giro,
+                estrato,
+                ubicacion.ciudad,
+                ubicacion.estado,
+                direccion
+            );
+
+            registros.push(RegistroCrudo {
+                fuente_origen: "INEGI-DENUE".to_string(),
+                url_evidencia,
+                capturado_en: ahora,
+                formato: FormatoCrudo::Json,
+                contenido_crudo,
+                nombre_detectado: Some(nombre_detectado),
+                empresa_detectada: Some(empresa_texto),
+                ubicacion_detectada: Some(ubicacion),
+                co_mencionados: Vec::new(),
+                datos_extra,
+                opt_out_detectado: false,
+            });
+        }
+
+        Ok(registros)
+    }
+}
+
+#[async_trait]
+impl OsintSource for DenueInegiAdapter {
+    fn nombre_fuente(&self) -> &str {
+        "INEGI-DENUE"
+    }
+
+    #[tracing::instrument(skip(self, consulta), fields(fuente = "INEGI-DENUE", estado = %consulta.ubicacion.estado))]
+    async fn recolectar(&self, consulta: &ConsultaObjetivo) -> OsintResult<Vec<RegistroCrudo>> {
+        let ahora = Utc::now();
+        if let Some(ref fixture) = self.fixture_inline {
+            let mut registros = Self::parsear_respuesta_denue(fixture, consulta, ahora)?;
+            if consulta.limite_resultados > 0 && registros.len() > consulta.limite_resultados {
+                registros.truncate(consulta.limite_resultados);
+            }
+            return Ok(registros);
+        }
+
+        let Some(ref token) = self.token else {
+            debug!("AURORA_INEGI_TOKEN no configurado; omitiendo conector INEGI-DENUE sin error");
+            return Ok(Vec::new());
+        };
+
+        let entidad = clave_entidad_inegi(&consulta.ubicacion.estado);
+        let condiciones = Self::condiciones_para_consulta(consulta);
+        let limite = if consulta.limite_resultados == 0 {
+            15
+        } else {
+            consulta.limite_resultados
+        };
+
+        let mut acumulados = Vec::new();
+        let mut vistos = std::collections::HashSet::new();
+
+        for condicion in condiciones {
+            if acumulados.len() >= limite {
+                break;
+            }
+            let url = self.construir_url_consulta(&condicion, entidad, limite, token);
+            match self.http.get_text_with_backoff("INEGI-DENUE", &url).await {
+                Ok(cuerpo) => {
+                    let lote = Self::parsear_respuesta_denue(&cuerpo, consulta, ahora)?;
+                    for reg in lote {
+                        let clave = reg
+                            .datos_extra
+                            .get("clee")
+                            .cloned()
+                            .unwrap_or_else(|| reg.url_evidencia.clone());
+                        if vistos.insert(clave) {
+                            acumulados.push(reg);
+                            if acumulados.len() >= limite {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(condicion = %condicion, error = %err, "Error consultando condición en DENUE INEGI");
+                }
+            }
+        }
+
+        Ok(acumulados)
+    }
+}
+
+/// Buscador web público sin API key para señales corporativas y directorios empresariales de México.
+///
+/// Combina `HttpSwarmClient` (semáforos por dominio, rotación de `User-Agent`, backoff exponencial)
+/// con extracción HTML/XML mediante `scraper` respetando trazabilidad LFPDPPP y exclusiones `opt_out`.
+pub struct WebPublicaMxAdapter {
+    nombre: String,
+    urls_fuente: Vec<String>,
+    http: HttpSwarmClient,
+    fixture_inline: Option<(String, String)>,
+}
+
+impl WebPublicaMxAdapter {
+    /// Crea un adaptador orientado a señales abiertas corporativas de México usando feed público RSS/HTML.
+    #[must_use]
+    pub fn new(http: HttpSwarmClient) -> Self {
+        Self {
+            nombre: "WebPublicaMX".to_string(),
+            urls_fuente: Vec::new(),
+            http,
+            fixture_inline: None,
+        }
+    }
+
+    /// Crea un adaptador consultando una lista explícita de directorios/portales públicos mexicanos.
+    #[must_use]
+    pub fn con_urls(
+        nombre: impl Into<String>,
+        urls_fuente: Vec<String>,
+        http: HttpSwarmClient,
+    ) -> Self {
+        let urls_limpias = urls_fuente
+            .into_iter()
+            .map(|u| u.trim().to_string())
+            .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+            .collect();
+        Self {
+            nombre: nombre.into(),
+            urls_fuente: urls_limpias,
+            http,
+            fixture_inline: None,
+        }
+    }
+
+    /// Crea un adaptador offline determinista sobre HTML o RSS corporativo mexicano para tests.
+    #[must_use]
+    pub fn desde_fixture_html(
+        nombre: impl Into<String>,
+        url_base: impl Into<String>,
+        raw_html: impl Into<String>,
+        http: HttpSwarmClient,
+    ) -> Self {
+        Self {
+            nombre: nombre.into(),
+            urls_fuente: Vec::new(),
+            http,
+            fixture_inline: Some((url_base.into(), raw_html.into())),
+        }
+    }
+
+    /// Construye el query de búsqueda corporativa en español de México para la consulta dada.
+    #[must_use]
+    pub fn construir_query_mx(consulta: &ConsultaObjetivo) -> String {
+        let terminos = if consulta.palabras_clave.is_empty() {
+            match consulta.vertical {
+                VerticalComercial::Inmobiliaria(_) => {
+                    "nave industrial parque industrial expansion".to_string()
+                }
+                VerticalComercial::Seguros(_) => {
+                    "empresa corporativo nombramiento director expansion".to_string()
+                }
+            }
+        } else {
+            consulta
+                .palabras_clave
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .take(4)
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+
+        format!(
+            "{} {} {} Mexico",
+            terminos,
+            consulta.ubicacion.ciudad.trim(),
+            consulta.ubicacion.estado.trim()
+        )
+    }
+
+    /// Parsea documentos HTML de noticias corporativas o directorios empresariales mexicanos
+    /// (y feeds RSS/XML públicos de prensa de negocios) hacia `RegistroCrudo` trazables.
+    pub fn parsear_html_corporativo_mx(
+        fuente: &str,
+        raw_doc: &str,
+        url_base: &str,
+        consulta: &ConsultaObjetivo,
+        ahora: DateTime<Utc>,
+    ) -> OsintResult<Vec<RegistroCrudo>> {
+        if raw_doc.contains("<rss") || raw_doc.contains("<item>") {
+            let rss_items = parsear_rss_corporativo_mx(fuente, raw_doc, url_base, consulta, ahora);
+            if !rss_items.is_empty() {
+                return Ok(rss_items);
+            }
+        }
+
+        let doc = Html::parse_document(raw_doc);
+        let sel_cards = parse_selector(
+            fuente,
+            "article, div.nota-corporativa, div.noticia, div.directorio-empresa, div.empresa-card, div.result, li.empresa-item",
+        )?;
+        let sel_titulo = parse_selector(fuente, "h1, h2, h3, .titulo, .headline, a.result__a")?;
+        let sel_cuerpo = parse_selector(
+            fuente,
+            "p, .resumen, .extracto, .descripcion, .cuerpo, .result__snippet",
+        )?;
+        let sel_directivo = parse_selector(
+            fuente,
+            ".directivo, .representante, .ejecutivo, .protagonista, .contacto-nombre",
+        )?;
+        let sel_empresa = parse_selector(
+            fuente,
+            ".empresa, .razon-social, .compania, .organizacion",
+        )?;
+        let sel_co = parse_selector(fuente, ".co-mencion, .socio")?;
+        let sel_link = parse_selector(
+            fuente,
+            "a.evidencia, a.fuente-link, a.result__a, h2 a, h3 a, a[href]",
+        )?;
+
+        let mut registros = Vec::new();
+        let mut urls_vistas = std::collections::HashSet::new();
+
+        for card in doc.select(&sel_cards) {
+            let titulo = first_text(&card, &sel_titulo).unwrap_or_default();
+            let cuerpo = card
+                .select(&sel_cuerpo)
+                .map(|el| el.text().collect::<Vec<_>>().join(" "))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let texto_total = format!("{titulo}. {cuerpo}");
+            if texto_total.trim().len() < 20 {
+                continue;
+            }
+
+            let href = card
+                .select(&sel_link)
+                .filter_map(|el| el.value().attr("href"))
+                .find(|h| {
+                    !h.trim().is_empty()
+                        && !h.trim().starts_with('#')
+                        && !h.trim().starts_with("javascript:")
+                })
+                .map(|h| resolver_url_absoluta(url_base, h))
+                .unwrap_or_else(|| url_base.to_string());
+
+            let empresa = first_text(&card, &sel_empresa)
+                .or_else(|| inferir_empresa_mx(&texto_total));
+            let directivo = first_text(&card, &sel_directivo)
+                .or_else(|| inferir_directivo_mx(&texto_total))
+                .or_else(|| empresa.as_ref().map(|e| format!("Dirección General {e}")));
+
+            let co_mencionados = card
+                .select(&sel_co)
+                .map(|el| {
+                    let nombre = el.text().collect::<Vec<_>>().join(" ").trim().to_string();
+                    let contexto = el
+                        .value()
+                        .attr("data-contexto")
+                        .unwrap_or("Directivo co-mencionado en nota corporativa")
+                        .to_string();
+                    CoMencionCruda {
+                        nombre,
+                        contexto,
+                        empresa: empresa.clone(),
+                    }
+                })
+                .filter(|c| !c.nombre.is_empty())
+                .collect();
+
+            let lower = texto_total.to_ascii_lowercase();
+            let opt_out = card.value().attr("data-opt-out") == Some("true")
+                || lower.contains("opt-out")
+                || lower.contains("derecho de oposición arco")
+                || lower.contains("no contactar");
+
+            let clave_dedup = format!("{}|{}", href, directivo.as_deref().unwrap_or(&titulo));
+            if !urls_vistas.insert(clave_dedup) {
+                continue;
+            }
+
+            let mut datos_extra = BTreeMap::new();
+            if !titulo.is_empty() {
+                datos_extra.insert("titulo".to_string(), titulo);
+            }
+            datos_extra.insert("origen_web_mx".to_string(), extraer_dominio(&href));
+
+            registros.push(RegistroCrudo {
+                fuente_origen: fuente.to_string(),
+                url_evidencia: href,
+                capturado_en: ahora,
+                formato: FormatoCrudo::Html,
+                contenido_crudo: texto_total,
+                nombre_detectado: directivo,
+                empresa_detectada: empresa,
+                ubicacion_detectada: Some(consulta.ubicacion.clone()),
+                co_mencionados,
+                datos_extra,
+                opt_out_detectado: opt_out,
+            });
+        }
+
+        Ok(registros)
+    }
+}
+
+#[async_trait]
+impl OsintSource for WebPublicaMxAdapter {
+    fn nombre_fuente(&self) -> &str {
+        &self.nombre
+    }
+
+    #[tracing::instrument(skip(self, consulta), fields(fuente = %self.nombre, ciudad = %consulta.ubicacion.ciudad))]
+    async fn recolectar(&self, consulta: &ConsultaObjetivo) -> OsintResult<Vec<RegistroCrudo>> {
+        let ahora = Utc::now();
+        if let Some((ref url_base, ref html)) = self.fixture_inline {
+            let mut registros =
+                Self::parsear_html_corporativo_mx(&self.nombre, html, url_base, consulta, ahora)?;
+            if consulta.limite_resultados > 0 && registros.len() > consulta.limite_resultados {
+                registros.truncate(consulta.limite_resultados);
+            }
+            return Ok(registros);
+        }
+
+        let urls: Vec<String> = if self.urls_fuente.is_empty() {
+            let query = Self::construir_query_mx(consulta);
+            vec![format!(
+                "https://news.google.com/rss/search?q={}&hl=es-419&gl=MX&ceid=MX:es-419",
+                percent_encode_segment(&query)
+            )]
+        } else {
+            self.urls_fuente.clone()
+        };
+
+        let limite = if consulta.limite_resultados == 0 {
+            15
+        } else {
+            consulta.limite_resultados
+        };
+        let mut acumulados = Vec::new();
+
+        for url in urls {
+            if acumulados.len() >= limite {
+                break;
+            }
+            match self.http.get_text_with_backoff(&self.nombre, &url).await {
+                Ok(cuerpo) => {
+                    match Self::parsear_html_corporativo_mx(
+                        &self.nombre,
+                        &cuerpo,
+                        &url,
+                        consulta,
+                        ahora,
+                    ) {
+                        Ok(lote) => acumulados.extend(lote),
+                        Err(err) => {
+                            warn!(url = %url, error = %err, "Error parseando documento público MX");
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(url = %url, error = %err, "Error consultando fuente web pública MX");
+                }
+            }
+        }
+
+        if acumulados.len() > limite {
+            acumulados.truncate(limite);
+        }
+        Ok(acumulados)
+    }
+}
+
+/// Convierte el nombre o abreviatura de una entidad federativa mexicana en su clave INEGI (`01`..`32`).
+#[must_use]
+pub fn clave_entidad_inegi(estado: &str) -> &'static str {
+    let norm = normalizar_texto_ascii(estado);
+    match norm.as_str() {
+        "aguascalientes" | "ags" => "01",
+        "baja california" | "bc" | "bcn" => "02",
+        "baja california sur" | "bcs" => "03",
+        "campeche" | "camp" => "04",
+        "coahuila" | "coahuila de zaragoza" | "coah" => "05",
+        "colima" | "col" => "06",
+        "chiapas" | "chis" => "07",
+        "chihuahua" | "chih" => "08",
+        "ciudad de mexico" | "cdmx" | "distrito federal" | "df" => "09",
+        "durango" | "dgo" => "10",
+        "guanajuato" | "gto" => "11",
+        "guerrero" | "gro" => "12",
+        "hidalgo" | "hgo" => "13",
+        "jalisco" | "jal" => "14",
+        "mexico" | "estado de mexico" | "edomex" | "mex" => "15",
+        "michoacan" | "michoacan de ocampo" | "mich" => "16",
+        "morelos" | "mor" => "17",
+        "nayarit" | "nay" => "18",
+        "nuevo leon" | "nl" => "19",
+        "oaxaca" | "oax" => "20",
+        "puebla" | "pue" => "21",
+        "queretaro" | "qro" => "22",
+        "quintana roo" | "qroo" | "q roo" => "23",
+        "san luis potosi" | "slp" => "24",
+        "sinaloa" | "sin" => "25",
+        "sonora" | "son" => "26",
+        "tabasco" | "tab" => "27",
+        "tamaulipas" | "tamps" => "28",
+        "tlaxcala" | "tlax" => "29",
+        "veracruz" | "veracruz de ignacio de la llave" | "ver" => "30",
+        "yucatan" | "yuc" => "31",
+        "zacatecas" | "zac" => "32",
+        _ => "00",
+    }
+}
+
+fn parsear_ubicacion_denue(
+    raw_ubicacion: Option<&str>,
+    colonia: Option<String>,
+    fallback: &Ubicacion,
+) -> Ubicacion {
+    if let Some(texto) = limpiar_opcional(raw_ubicacion) {
+        let partes: Vec<&str> = texto
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if partes.len() >= 3 {
+            return Ubicacion {
+                ciudad: capitalizar_frase(partes[1]),
+                estado: capitalizar_frase(partes[2]),
+                zona: colonia.or_else(|| fallback.zona.clone()),
+            };
+        }
+        if partes.len() == 2 {
+            return Ubicacion {
+                ciudad: capitalizar_frase(partes[0]),
+                estado: capitalizar_frase(partes[1]),
+                zona: colonia.or_else(|| fallback.zona.clone()),
+            };
+        }
+    }
+    Ubicacion {
+        ciudad: fallback.ciudad.clone(),
+        estado: fallback.estado.clone(),
+        zona: colonia.or_else(|| fallback.zona.clone()),
+    }
+}
+
+fn parsear_rss_corporativo_mx(
+    fuente: &str,
+    raw_xml: &str,
+    url_base: &str,
+    consulta: &ConsultaObjetivo,
+    ahora: DateTime<Utc>,
+) -> Vec<RegistroCrudo> {
+    let mut registros = Vec::new();
+    let mut cursor = raw_xml;
+
+    while let Some(inicio) = cursor.find("<item>") {
+        let resto = &cursor[inicio + "<item>".len()..];
+        let Some(fin) = resto.find("</item>") else {
+            break;
+        };
+        let bloque = &resto[..fin];
+        cursor = &resto[fin + "</item>".len()..];
+
+        let titulo = extraer_tag_xml(bloque, "title").unwrap_or_default();
+        let link = extraer_tag_xml(bloque, "link").unwrap_or_else(|| url_base.to_string());
+        let desc_raw = extraer_tag_xml(bloque, "description").unwrap_or_default();
+        let desc_limpia = Html::parse_fragment(&desc_raw)
+            .root_element()
+            .text()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let source_name = extraer_tag_xml(bloque, "source");
+
+        let texto_total = format!("{titulo}. {desc_limpia}");
+        if texto_total.trim().len() < 15 {
+            continue;
+        }
+
+        let empresa = inferir_empresa_mx(&texto_total).or(source_name);
+        let directivo = inferir_directivo_mx(&texto_total)
+            .or_else(|| empresa.as_ref().map(|e| format!("Dirección General {e}")));
+
+        let mut datos_extra = BTreeMap::new();
+        if !titulo.is_empty() {
+            datos_extra.insert("titulo".to_string(), titulo);
+        }
+        datos_extra.insert("origen_web_mx".to_string(), extraer_dominio(&link));
+
+        registros.push(RegistroCrudo {
+            fuente_origen: fuente.to_string(),
+            url_evidencia: link,
+            capturado_en: ahora,
+            formato: FormatoCrudo::Html,
+            contenido_crudo: texto_total,
+            nombre_detectado: directivo,
+            empresa_detectada: empresa,
+            ubicacion_detectada: Some(consulta.ubicacion.clone()),
+            co_mencionados: Vec::new(),
+            datos_extra,
+            opt_out_detectado: false,
+        });
+    }
+
+    registros
+}
+
+fn extraer_tag_xml(bloque: &str, tag: &str) -> Option<String> {
+    let apertura_simple = format!("<{tag}>");
+    let cierre = format!("</{tag}>");
+
+    let inicio_contenido = if let Some(idx) = bloque.find(&apertura_simple) {
+        idx + apertura_simple.len()
+    } else {
+        let apertura_attr = format!("<{tag} ");
+        let idx = bloque.find(&apertura_attr)?;
+        let fin_tag = bloque[idx..].find('>')?;
+        idx + fin_tag + 1
+    };
+
+    let resto = &bloque[inicio_contenido..];
+    let fin = resto.find(&cierre)?;
+    let valor = resto[..fin].trim();
+    let sin_cdata = valor
+        .strip_prefix("<![CDATA[")
+        .and_then(|s| s.strip_suffix("]]>"))
+        .unwrap_or(valor);
+    let decodificado = sin_cdata
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .trim()
+        .to_string();
+
+    if decodificado.is_empty() {
+        None
+    } else {
+        Some(decodificado)
+    }
+}
+
+fn inferir_empresa_mx(texto: &str) -> Option<String> {
+    let marcadores = [
+        "S.A. de C.V.",
+        "SA de CV",
+        "S.A.P.I. de C.V.",
+        "S. de R.L. de C.V.",
+        "S.C.",
+    ];
+    for marcador in marcadores {
+        if let Some(pos) = texto.find(marcador) {
+            let prefijo = texto[..pos].trim_end();
+            let palabras: Vec<&str> = prefijo
+                .split_whitespace()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let inicio_mayus = palabras
+                .iter()
+                .position(|w| w.chars().next().is_some_and(char::is_uppercase))
+                .unwrap_or(0);
+            let candidato = format!("{} {}", palabras[inicio_mayus..].join(" "), marcador)
+                .trim()
+                .to_string();
+            if candidato.len() > marcador.len() + 2 {
+                return Some(candidato);
+            }
+        }
+    }
+
+    for pref in [
+        "Grupo ",
+        "Parque Industrial ",
+        "Constructora ",
+        "Clínica ",
+        "Inmobiliaria ",
+    ] {
+        if let Some(pos) = texto.find(pref) {
+            let segmento = &texto[pos..];
+            let palabras: Vec<&str> = segmento
+                .split([',', '.', ';', '|', '(', ')'])
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .take(4)
+                .collect();
+            if palabras.len() >= 2 {
+                return Some(palabras.join(" "));
+            }
+        }
+    }
+    None
+}
+
+fn inferir_directivo_mx(texto: &str) -> Option<String> {
+    let patrones = [
+        "nombra a ",
+        "designa a ",
+        "encabezado por ",
+        "dirigido por ",
+        "director general ",
+        "directora general ",
+        "fundador ",
+    ];
+    let lower = texto.to_lowercase();
+    for pat in patrones {
+        if let Some(byte_pos) = lower.find(pat) {
+            let inicio = byte_pos + pat.len();
+            if inicio < texto.len() && texto.is_char_boundary(inicio) {
+                let candidato: Vec<&str> = texto[inicio..]
+                    .split([',', '.', ';', ':', '(', ')'])
+                    .next()
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .take(3)
+                    .filter(|w| w.chars().next().is_some_and(char::is_uppercase))
+                    .collect();
+                if candidato.len() >= 2 {
+                    return Some(candidato.join(" "));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolver_url_absoluta(url_base: &str, href: &str) -> String {
+    let h = href.trim();
+    if h.starts_with("http://") || h.starts_with("https://") {
+        return h.to_string();
+    }
+    let esquema = if url_base.starts_with("http://") {
+        "http://"
+    } else {
+        "https://"
+    };
+    let dominio = extraer_dominio(url_base);
+    if h.starts_with("//") {
+        return format!("https:{h}");
+    }
+    if h.starts_with('/') {
+        format!("{esquema}{dominio}{h}")
+    } else {
+        format!("{esquema}{dominio}/{h}")
+    }
+}
+
+fn limpiar_opcional(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null") && *s != "0")
+        .map(str::to_string)
+}
+
+fn normalizar_texto_ascii(input: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    input
+        .nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .collect::<String>()
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn capitalizar_frase(input: &str) -> String {
+    input
+        .split_whitespace()
+        .map(|w| {
+            let mut chars = w.chars();
+            match chars.next() {
+                Some(first) => {
+                    let up: String = first.to_uppercase().collect();
+                    let rest: String = chars.as_str().to_lowercase();
+                    format!("{up}{rest}")
+                }
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn percent_encode_segment(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 2);
+    for b in input.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(b));
+        } else {
+            use std::fmt::Write;
+            let _ = write!(&mut out, "%{b:02X}");
+        }
+    }
+    out
+}
+
 fn extraer_dominio(url: &str) -> String {
     url.split("://")
         .nth(1)

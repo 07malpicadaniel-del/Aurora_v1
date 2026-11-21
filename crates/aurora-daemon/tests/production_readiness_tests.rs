@@ -428,3 +428,49 @@ async fn test_cdp_hidrata_spa_y_despacho_smtp_rechaza_correo_invalido_y_opt_out(
     let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
+
+#[tokio::test]
+async fn test_scheduler_dpo_ciclo_autonomo_exclusion_slot_y_cancelacion_limpia(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dir = crear_temp_dir("aurora_scheduler_dpo")?;
+    let state = AuroraDaemonState::para_pruebas_offline(&dir)?;
+
+    // Sostener temporalmente el lock exclusivo de slot_id = 0 para verificar que el scheduler no choca.
+    let slot_lock = state.bob_slot_lock();
+    let guard_interactivo = slot_lock.lock().await;
+
+    let handle = aurora_daemon::iniciar_scheduler_dpo_con_intervalo(
+        std::sync::Arc::clone(&state),
+        std::time::Duration::from_millis(30),
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(70)).await;
+    assert_eq!(
+        state.estado_scheduler_dpo().ciclos_completados,
+        0,
+        "el scheduler no debe ejecutar DPO mientras slot_id=0 esté ocupado por una operación interactiva"
+    );
+
+    // Liberar slot_id = 0 y comprobar ejecución autónoma + exposición en GET /api/v1/pulse/estado
+    drop(guard_interactivo);
+
+    let mut ciclos = 0;
+    for _ in 0..25 {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        ciclos = state.estado_scheduler_dpo().ciclos_completados;
+        if ciclos >= 1 {
+            break;
+        }
+    }
+    assert!(ciclos >= 1, "el scheduler debió completar al menos 1 ciclo autónomo");
+
+    let pulse = state.estado_pulso();
+    assert!(pulse.scheduler_dpo.habilitado);
+    assert!(pulse.scheduler_dpo.ciclos_completados >= 1);
+    assert!(pulse.scheduler_dpo.ultima_ejecucion.is_some());
+    assert!(pulse.scheduler_dpo.proxima_ejecucion.is_some());
+
+    handle.detener_y_esperar().await;
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
