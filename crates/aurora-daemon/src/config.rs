@@ -6,8 +6,9 @@ use std::time::Duration;
 use aurora_council::{
     ConfigCuotasConsejo, MiembroConsejo, PoliticaCuotaProveedor, DEFAULT_COUNCIL_CLI_TIMEOUT_MS,
 };
+use aurora_domain::VerticalComercial;
 use aurora_osint::{ConfigCdpFetcher, HttpCdpBrowserFetcher};
-use aurora_pulse::ConfigSmtp;
+use aurora_pulse::{ConfigMetaReels, ConfigSmtp, ConfigYouTubeShorts};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -112,6 +113,54 @@ impl Default for ConfigCouncilDaemon {
     }
 }
 
+/// Plaza geográfica y vertical objetivo para cacería OSINT autónoma (Carril Verde AFK).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlazaOsintProgramada {
+    /// Ciudad objetivo en México (ej. `"Monterrey"`).
+    pub ciudad: String,
+    /// Entidad federativa (ej. `"Nuevo León"`).
+    pub estado: String,
+    /// Zona comercial o industrial opcional.
+    #[serde(default)]
+    pub zona: Option<String>,
+    /// Vertical comercial objetivo.
+    pub vertical: VerticalComercial,
+    /// Palabras clave públicas de intención.
+    #[serde(default)]
+    pub palabras_clave: Vec<String>,
+    /// Máximo de registros públicos por corrida.
+    #[serde(default)]
+    pub limite_resultados: Option<usize>,
+}
+
+/// Configuración de la sección `[scheduler]` para operación AFK 24/7 (Carril Verde).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConfigSchedulerAfk {
+    /// Activa cacerías OSINT programadas sobre `plazas_osint` (`false` por defecto para cero tráfico accidental).
+    pub hunt_programado_habilitado: bool,
+    /// Intervalo en minutos entre cacerías OSINT programadas (`360` por defecto).
+    pub hunt_intervalo_minutos: u64,
+    /// Plazas y verticales a monitorear cuando `hunt_programado_habilitado = true`.
+    pub plazas_osint: Vec<PlazaOsintProgramada>,
+    /// Activa revisión periódica de cola de publicación orgánica (Carril Verde sin PII).
+    pub publicacion_organica_habilitada: bool,
+    /// Intervalo en minutos entre revisiones de la cola de publicación orgánica (`120` por defecto).
+    pub organico_intervalo_minutos: u64,
+}
+
+impl Default for ConfigSchedulerAfk {
+    fn default() -> Self {
+        Self {
+            hunt_programado_habilitado: false,
+            hunt_intervalo_minutos: 360,
+            plazas_osint: Vec::new(),
+            publicacion_organica_habilitada: false,
+            organico_intervalo_minutos: 120,
+        }
+    }
+}
+
 /// Configuración de la sección `[factory]` en `aurora.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -193,6 +242,17 @@ pub struct AuroraDaemonConfig {
     pub dpo_hora_utc: u8,
     /// Intervalo entre ciclos DPO en minutos (por defecto `360` = cada 6 horas).
     pub dpo_intervalo_minutos: u64,
+    /// Token opcional `Authorization: Bearer <token>` (`AURORA_MOBILE_TOKEN`) para proteger `/api/v1/*`
+    /// cuando `bind_addr` escucha en interfaz Tailscale (`100.x.y.z:8090`).
+    pub mobile_token: Option<String>,
+    /// Token OAuth YouTube Data API v3 (`AURORA_YOUTUBE_ACCESS_TOKEN`).
+    pub youtube_access_token: Option<String>,
+    /// Usuario IG Business para Meta Graph API (`AURORA_META_IG_USER_ID`).
+    pub meta_ig_user_id: Option<String>,
+    /// Token de acceso Meta Graph API (`AURORA_META_ACCESS_TOKEN`).
+    pub meta_access_token: Option<String>,
+    /// URL pública HTTPS base para entrega de `video_url` a Meta Graph (`AURORA_META_MEDIA_BASE_URL`).
+    pub meta_media_base_url: Option<String>,
     /// Configuración SMTP (`lettre` + `tokio1-rustls-tls`) y cumplimiento LFPDPPP `List-Unsubscribe`.
     pub smtp: ConfigSmtp,
     /// Configuración del Consejo Multi-Agente (`aurora-council`) y límites de cuotas NVMe.
@@ -201,6 +261,8 @@ pub struct AuroraDaemonConfig {
     pub factory: ConfigFactoryDaemon,
     /// Configuración del sandbox Git aislado (`aurora-forge`, Carril Ámbar).
     pub forge: ConfigForgeDaemon,
+    /// Configuración del orquestador circadiano AFK 24/7 (`[scheduler]`).
+    pub scheduler: ConfigSchedulerAfk,
 }
 
 impl Default for AuroraDaemonConfig {
@@ -229,10 +291,16 @@ impl Default for AuroraDaemonConfig {
             dpo_scheduler_habilitado: true,
             dpo_hora_utc: 9,
             dpo_intervalo_minutos: 360,
+            mobile_token: None,
+            youtube_access_token: None,
+            meta_ig_user_id: None,
+            meta_access_token: None,
+            meta_media_base_url: None,
             smtp: ConfigSmtp::default(),
             council: ConfigCouncilDaemon::default(),
             factory: ConfigFactoryDaemon::default(),
             forge: ConfigForgeDaemon::default(),
+            scheduler: ConfigSchedulerAfk::default(),
         }
     }
 }
@@ -424,6 +492,42 @@ impl AuroraDaemonConfig {
     #[must_use]
     pub fn forge_ordenes_path_efectivo(&self) -> PathBuf {
         self.data_dir_resuelto().join("forge_ordenes.json")
+    }
+
+    /// Indica si `bind_addr` escucha fuera de loopback local (ej. interfaz Tailscale `100.x.y.z:8090`).
+    #[must_use]
+    pub fn es_bind_remoto_o_tailscale(&self) -> bool {
+        let host = self.bind_addr.trim().to_ascii_lowercase();
+        !(host.starts_with("127.") || host.starts_with("localhost:") || host.starts_with("[::1]:"))
+    }
+
+    /// Devuelve el token Bearer efectivo cuando la autenticación móvil/Tailscale está activa.
+    #[must_use]
+    pub fn mobile_token_activo(&self) -> Option<&str> {
+        self.mobile_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    }
+
+    /// Construye la configuración de [`aurora_pulse::YouTubeShortsApiPublisher`].
+    #[must_use]
+    pub fn config_youtube_shorts(&self) -> ConfigYouTubeShorts {
+        ConfigYouTubeShorts {
+            access_token: self.youtube_access_token.clone(),
+            ..ConfigYouTubeShorts::default()
+        }
+    }
+
+    /// Construye la configuración de [`aurora_pulse::MetaReelsGraphPublisher`].
+    #[must_use]
+    pub fn config_meta_reels(&self) -> ConfigMetaReels {
+        ConfigMetaReels {
+            ig_user_id: self.meta_ig_user_id.clone(),
+            access_token: self.meta_access_token.clone(),
+            media_public_base_url: self.meta_media_base_url.clone(),
+            ..ConfigMetaReels::default()
+        }
     }
 
     /// Ruta resuelta del modelo Piper `.onnx`.
@@ -633,6 +737,40 @@ impl AuroraDaemonConfig {
             })?;
         }
 
+        // Overrides portal móvil Tailscale, APIs sociales orgánicas y [scheduler]
+        if let Some(v) = leer_env("AURORA_MOBILE_TOKEN") {
+            let limpio = v.trim().to_string();
+            self.mobile_token = if limpio.is_empty() { None } else { Some(limpio) };
+        }
+        if let Some(v) = leer_env("AURORA_YOUTUBE_ACCESS_TOKEN") {
+            let limpio = v.trim().to_string();
+            self.youtube_access_token = if limpio.is_empty() { None } else { Some(limpio) };
+        }
+        if let Some(v) = leer_env("AURORA_META_IG_USER_ID") {
+            let limpio = v.trim().to_string();
+            self.meta_ig_user_id = if limpio.is_empty() { None } else { Some(limpio) };
+        }
+        if let Some(v) = leer_env("AURORA_META_ACCESS_TOKEN") {
+            let limpio = v.trim().to_string();
+            self.meta_access_token = if limpio.is_empty() { None } else { Some(limpio) };
+        }
+        if let Some(v) = leer_env("AURORA_META_MEDIA_BASE_URL") {
+            let limpio = v.trim().trim_end_matches('/').to_string();
+            self.meta_media_base_url = if limpio.is_empty() { None } else { Some(limpio) };
+        }
+        if let Some(v) =
+            leer_env("AURORA_SCHEDULER_HUNT_HABILITADO").filter(|s| !s.trim().is_empty())
+        {
+            self.scheduler.hunt_programado_habilitado =
+                parsear_bool_env("AURORA_SCHEDULER_HUNT_HABILITADO", &v)?;
+        }
+        if let Some(v) =
+            leer_env("AURORA_SCHEDULER_ORGANICO_HABILITADO").filter(|s| !s.trim().is_empty())
+        {
+            self.scheduler.publicacion_organica_habilitada =
+                parsear_bool_env("AURORA_SCHEDULER_ORGANICO_HABILITADO", &v)?;
+        }
+
         Ok(())
     }
 
@@ -693,6 +831,18 @@ impl AuroraDaemonConfig {
                 "forge.timeout_segundos={} debe ser >= 5 s",
                 self.forge.timeout_segundos
             )));
+        }
+        if self.scheduler.hunt_programado_habilitado && self.scheduler.hunt_intervalo_minutos == 0 {
+            return Err(DaemonError::Configuracion(
+                "scheduler.hunt_intervalo_minutos debe ser >= 1 cuando hunt_programado_habilitado = true".to_string(),
+            ));
+        }
+        if self.scheduler.publicacion_organica_habilitada
+            && self.scheduler.organico_intervalo_minutos == 0
+        {
+            return Err(DaemonError::Configuracion(
+                "scheduler.organico_intervalo_minutos debe ser >= 1 cuando publicacion_organica_habilitada = true".to_string(),
+            ));
         }
         Ok(())
     }

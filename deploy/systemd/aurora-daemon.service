@@ -1,23 +1,27 @@
 [Unit]
-Description=Aurora v2 Autonomous Commercial Intelligence Daemon
+Description=Aurora v2 Autonomous Commercial Intelligence Daemon (AFK 24/7)
 Documentation=https://github.com/07malpicadaniel-del/Aurora_v1
-After=network-online.target
-Wants=network-online.target
+After=network-online.target bob-llama.service
+Wants=network-online.target bob-llama.service
 
 [Service]
 Type=simple
 WorkingDirectory=%h/.local/share/aurora
-# Ajustar la ruta al binario compilado en --release:
 ExecStart=%h/.local/bin/aurora-daemon
-Environment=RUST_LOG=aurora_daemon=info,aurora_pulse=info,tower_http=info
+Environment=RUST_LOG=aurora_daemon=info,aurora_pulse=info,aurora_council=info,tower_http=info
 Environment=AURORA_CONFIG_PATH=%h/.config/aurora/aurora.toml
-# Secrets opcionales (ej. AURORA_SMTP_PASSWORD) sin versionar:
+# Secrets opcionales sin versionar:
+#   AURORA_MOBILE_TOKEN=... (recomendado al enlazar en Tailscale 100.x.y.z:8090)
+#   AURORA_SMTP_PASSWORD=...
+#   AURORA_YOUTUBE_ACCESS_TOKEN=...
+#   AURORA_META_IG_USER_ID=...
+#   AURORA_META_ACCESS_TOKEN=...
+#   AURORA_META_MEDIA_BASE_URL=...
 EnvironmentFile=-%h/.config/aurora/secrets.env
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=15
 KillSignal=SIGTERM
-# Endurecimiento básico compatible con subprocesos chromium/ffmpeg/piper en CPU:
 NoNewPrivileges=true
 PrivateTmp=true
 

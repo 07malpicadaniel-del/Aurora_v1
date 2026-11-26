@@ -196,6 +196,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "aurora-cortex",
+ "aurora-council",
  "aurora-domain",
  "aurora-factory",
  "aurora-memory",
@@ -203,6 +204,7 @@ dependencies = [
  "chrono",
  "lettre",
  "parking_lot",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

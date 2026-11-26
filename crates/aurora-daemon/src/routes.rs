@@ -7,9 +7,10 @@ use aurora_factory::ClipBroll;
 use aurora_pulse::{EstadoCampanaProspecto, EventoTelemetria};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::{Path, Request, State};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use tokio_stream::wrappers::BroadcastStream;
@@ -20,19 +21,23 @@ use uuid::Uuid;
 
 use crate::config::ReporteSubsistemas;
 use crate::error::{DaemonError, DaemonResult};
+use crate::mobile_ui::{
+    handler_mobile_portal, respuesta_no_autorizada, verificar_cabecera_bearer,
+};
 use crate::state::{
     AprobarOrdenRequest, AprobarOrdenResponse, AuroraDaemonState, BrollEstadoResponse,
     CouncilCuotasResponse, CrearOrdenForjaRequest, DelegarConsejoRequest, DpoConsolidarResponse,
     ForgeOrdenesResponse, GatekeeperPendientesResponse, GenerarBriefsHiggsfieldRequest,
     GenerarBriefsHiggsfieldResponse, HealthResponse, HuntRequest, HuntResponse, OptOutRequest,
-    OptOutResponse, OrdenPendienteDto, PulseEstadoResponse, RechazarOrdenRequest,
-    RegistrarClipBrollRequest, RegistroOrdenForjaDto, TelaranaResponse,
+    OptOutResponse, OrdenPendienteDto, PublicarOrganicoRequest, PublicarOrganicoResponse,
+    PulseEstadoResponse, PulseOrganicoResponse, RechazarOrdenRequest, RegistrarClipBrollRequest,
+    RegistroOrdenForjaDto, TelaranaResponse,
 };
 use aurora_memory::SubgrafoProspecto;
 
-/// Construye el router HTTP + stream SSE completo para `aurora-daemon`.
+/// Construye el router HTTP + portal móvil + stream SSE/WS completo para `aurora-daemon`.
 pub fn crear_router(state: Arc<AuroraDaemonState>) -> Router {
-    Router::new()
+    let api_router = Router::new()
         .route("/api/v1/health", get(handler_health))
         .route("/api/v1/health/subsistemas", get(handler_subsistemas))
         .route("/api/v1/osint/hunt", post(handler_hunt))
@@ -60,6 +65,11 @@ pub fn crear_router(state: Arc<AuroraDaemonState>) -> Router {
         .route("/api/v1/lfpdppp/opt-out", post(handler_lfpdppp_opt_out))
         .route("/api/v1/pulse/estado", get(handler_pulse_estado))
         .route("/api/v1/pulse/telemetria", post(handler_pulse_telemetria))
+        .route("/api/v1/pulse/organico", get(handler_pulse_organico))
+        .route(
+            "/api/v1/pulse/organico/publicar",
+            post(handler_pulse_organico_publicar),
+        )
         .route("/api/v1/dpo/consolidar", post(handler_dpo_consolidar))
         .route("/api/v1/council/cuotas", get(handler_council_cuotas))
         .route("/api/v1/council/delegar", post(handler_council_delegar))
@@ -78,9 +88,30 @@ pub fn crear_router(state: Arc<AuroraDaemonState>) -> Router {
         )
         .route("/api/v1/eventos/stream", get(handler_eventos_sse))
         .route("/api/v1/ws", get(handler_eventos_ws))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            middleware_auth_mobile,
+        ));
+
+    Router::new()
+        .route("/mobile", get(handler_mobile_portal))
+        .merge(api_router)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn middleware_auth_mobile(
+    State(state): State<Arc<AuroraDaemonState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Some(token_esperado) = state.config().mobile_token_activo() {
+        if !verificar_cabecera_bearer(request.headers(), token_esperado) {
+            return respuesta_no_autorizada();
+        }
+    }
+    next.run(request).await
 }
 
 async fn handler_health(State(state): State<Arc<AuroraDaemonState>>) -> Json<HealthResponse> {
@@ -177,6 +208,20 @@ async fn handler_pulse_telemetria(
 ) -> DaemonResult<Json<EstadoCampanaProspecto>> {
     let estado = state.registrar_evento_telemetria(evento).await?;
     Ok(Json(estado))
+}
+
+async fn handler_pulse_organico(
+    State(state): State<Arc<AuroraDaemonState>>,
+) -> Json<PulseOrganicoResponse> {
+    Json(state.obtener_estado_organico())
+}
+
+async fn handler_pulse_organico_publicar(
+    State(state): State<Arc<AuroraDaemonState>>,
+    Json(req): Json<PublicarOrganicoRequest>,
+) -> DaemonResult<Json<PublicarOrganicoResponse>> {
+    let resp = state.publicar_reel_organico(req).await?;
+    Ok(Json(resp))
 }
 
 async fn handler_dpo_consolidar(

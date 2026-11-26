@@ -45,12 +45,16 @@ use aurora_osint::{
     SenalesAbiertasAdapter, WebPublicaMxAdapter,
 };
 use aurora_pulse::{
-    ChannelTransport, ComprobanteDespacho, ConfigCalentamiento, ConfigConsolidacionNocturna,
+    validar_solicitud_organica, ChannelTransport, ComprobanteDespacho,
+    ComprobantePublicacionOrganica, ConfigCalentamiento, ConfigConsolidacionNocturna,
     ControladorTasaPlataforma, DatasetPreferenciasDpo, DespachadorMulticanal,
-    DeterministicMockTransport, DeterministicMockWarmupDriver, EstadoTasaPlataforma,
-    EventoTelemetria, GestorCalentamientoPeriferico, MotorConsolidacionNocturna, PlataformaPulso,
-    PulseResult, RecolectorTelemetria, RegistroInteraccion, ResumenGanchoTelemetria,
-    SmtpEmailTransport, SocialWarmupDriver, TipoEventoTelemetria,
+    DeterministicMockSocialPublisher, DeterministicMockTransport, DeterministicMockWarmupDriver,
+    EstadoPublicadorOrganico, EstadoTasaPlataforma, EventoTelemetria,
+    GestorCalentamientoPeriferico, GestorPublicacionOrganica, MetaReelsGraphPublisher,
+    MotorConsolidacionNocturna, OrganicSocialPublisher, PlataformaPulso, PulseResult,
+    RecolectorTelemetria, RegistroInteraccion, ResumenGanchoTelemetria, SmtpEmailTransport,
+    SocialWarmupDriver, SolicitudPublicacionOrganica, TipoEventoTelemetria,
+    YouTubeShortsApiPublisher,
 };
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
@@ -688,6 +692,52 @@ pub struct GenerarBriefsHiggsfieldResponse {
     pub total_en_cola: usize,
 }
 
+/// Elemento en cola de publicación orgánica programada (Carril Verde sin PII).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicacionOrganicaProgramada {
+    /// Identificador único de entrada en cola orgánica.
+    pub id: Uuid,
+    /// Plataforma objetivo (`YouTubeShorts` o `Instagram`).
+    pub plataforma: PlataformaPulso,
+    /// Solicitud orgánica validada (libre de PII + SHA-256).
+    pub solicitud: SolicitudPublicacionOrganica,
+    /// Fecha UTC en que fue encolada.
+    pub encolada_en: DateTime<Utc>,
+}
+
+/// Respuesta de `GET /api/v1/pulse/organico`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PulseOrganicoResponse {
+    /// Indica si el scheduler AFK tiene habilitada la revisión periódica de cola orgánica.
+    pub habilitado_en_scheduler: bool,
+    /// Disponibilidad de adaptadores YouTube Shorts y Meta Reels.
+    pub publicadores: Vec<EstadoPublicadorOrganico>,
+    /// Publicaciones orgánicas programadas pendientes de fecha UTC.
+    pub cola_programada: Vec<PublicacionOrganicaProgramada>,
+    /// Historial reciente de publicaciones orgánicas completadas.
+    pub publicaciones_realizadas: Vec<ComprobantePublicacionOrganica>,
+}
+
+/// Solicitud para `POST /api/v1/pulse/organico/publicar`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicarOrganicoRequest {
+    /// Plataforma destino (`YouTubeShorts` o `Instagram`).
+    pub plataforma: PlataformaPulso,
+    /// Metadatos y archivo `.mp4` sellado (libre de PII).
+    pub solicitud: SolicitudPublicacionOrganica,
+}
+
+/// Respuesta de `POST /api/v1/pulse/organico/publicar`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicarOrganicoResponse {
+    /// `true` si se programó para una fecha UTC futura en la cola del scheduler AFK.
+    pub encolado: bool,
+    /// Comprobante emitido cuando se publicó de inmediato.
+    pub comprobante: Option<ComprobantePublicacionOrganica>,
+    /// Fecha UTC programada cuando `encolado == true`.
+    pub programado_para: Option<DateTime<Utc>>,
+}
+
 /// Evento emitido en tiempo real hacia `/api/v1/eventos/stream`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventoDaemon {
@@ -750,11 +800,13 @@ pub struct AuroraDaemonState {
     rate_limiter: Arc<ControladorTasaPlataforma>,
     warmup_gestor: GestorCalentamientoPeriferico<DynWarmupDriver>,
     despachador: DespachadorMulticanal<DynChannelTransport>,
+    gestor_organico: Arc<GestorPublicacionOrganica>,
     telemetria: Arc<RecolectorTelemetria>,
     motor_dpo: MotorConsolidacionNocturna<DynBobBackend>,
     consejo: Arc<OrquestadorConsejo>,
     scheduler_estado: Mutex<EstadoSchedulerDpo>,
     cola_gatekeeper: Mutex<BTreeMap<Uuid, RegistroOrdenInterno>>,
+    cola_organica: Mutex<Vec<PublicacionOrganicaProgramada>>,
     forge_ordenes: Mutex<Vec<RegistroOrdenForjaDto>>,
     calentamientos_recientes: Mutex<Vec<RegistroInteraccion>>,
     despachos_recientes: Mutex<Vec<ComprobanteDespacho>>,
@@ -901,6 +953,14 @@ impl AuroraDaemonState {
 
     /// Construye un estado determinista completamente offline ideal para pruebas de integración HTTP.
     pub fn para_pruebas_offline(base_dir: &Path) -> DaemonResult<Arc<Self>> {
+        Self::para_pruebas_offline_con_token(base_dir, None)
+    }
+
+    /// Variante offline de pruebas con token opcional `AURORA_MOBILE_TOKEN` para verificar auth Bearer.
+    pub fn para_pruebas_offline_con_token(
+        base_dir: &Path,
+        mobile_token: Option<String>,
+    ) -> DaemonResult<Arc<Self>> {
         let config = AuroraDaemonConfig {
             bind_addr: "127.0.0.1:0".to_string(),
             data_dir: base_dir.to_path_buf(),
@@ -908,6 +968,7 @@ impl AuroraDaemonState {
             modo_ejecucion: ModoEjecucion::SimuladoOffline,
             osint_web_publica_habilitada: false,
             dpo_scheduler_habilitado: false,
+            mobile_token,
             ..AuroraDaemonConfig::default()
         };
 
@@ -1044,6 +1105,45 @@ impl AuroraDaemonState {
             Arc::clone(&rate_limiter),
         );
 
+        let mut gestor_organico = GestorPublicacionOrganica::new(Arc::clone(&rate_limiter));
+        match config.modo_efectivo() {
+            ModoEjecucion::SimuladoOffline => {
+                gestor_organico.registrar_publicador(Arc::new(
+                    DeterministicMockSocialPublisher::new(PlataformaPulso::YouTubeShorts),
+                ));
+                gestor_organico.registrar_publicador(Arc::new(
+                    DeterministicMockSocialPublisher::new(PlataformaPulso::Instagram),
+                ));
+            }
+            ModoEjecucion::EstrictoReal => {
+                let yt: Arc<dyn OrganicSocialPublisher> =
+                    Arc::new(YouTubeShortsApiPublisher::new(config.config_youtube_shorts())?);
+                let ig: Arc<dyn OrganicSocialPublisher> =
+                    Arc::new(MetaReelsGraphPublisher::new(config.config_meta_reels())?);
+                gestor_organico.registrar_publicador(yt);
+                gestor_organico.registrar_publicador(ig);
+            }
+            ModoEjecucion::RealConFallback => {
+                let yt_real = YouTubeShortsApiPublisher::new(config.config_youtube_shorts())?;
+                if yt_real.modo_real_configurado() {
+                    gestor_organico.registrar_publicador(Arc::new(yt_real));
+                } else {
+                    gestor_organico.registrar_publicador(Arc::new(
+                        DeterministicMockSocialPublisher::new(PlataformaPulso::YouTubeShorts),
+                    ));
+                }
+                let ig_real = MetaReelsGraphPublisher::new(config.config_meta_reels())?;
+                if ig_real.modo_real_configurado() {
+                    gestor_organico.registrar_publicador(Arc::new(ig_real));
+                } else {
+                    gestor_organico.registrar_publicador(Arc::new(
+                        DeterministicMockSocialPublisher::new(PlataformaPulso::Instagram),
+                    ));
+                }
+            }
+        }
+        let gestor_organico = Arc::new(gestor_organico);
+
         let http_probe = Client::builder()
             .timeout(std::time::Duration::from_millis(500))
             .build()
@@ -1064,6 +1164,10 @@ impl AuroraDaemonState {
             ultima_ejecucion: None,
             ciclos_completados: 0,
             ultimo_resultado: None,
+            hunt_programado_habilitado: config.scheduler.hunt_programado_habilitado,
+            hunts_ejecutados: 0,
+            publicacion_organica_habilitada: config.scheduler.publicacion_organica_habilitada,
+            publicaciones_organicas_procesadas: 0,
         };
 
         Ok(Arc::new(Self {
@@ -1080,11 +1184,13 @@ impl AuroraDaemonState {
             rate_limiter,
             warmup_gestor,
             despachador,
+            gestor_organico,
             telemetria: Arc::new(RecolectorTelemetria::new()),
             motor_dpo,
             consejo,
             scheduler_estado: Mutex::new(scheduler_inicial),
             cola_gatekeeper: Mutex::new(cola_inicial),
+            cola_organica: Mutex::new(Vec::new()),
             forge_ordenes: Mutex::new(forge_inicial),
             calentamientos_recientes: Mutex::new(Vec::new()),
             despachos_recientes: Mutex::new(Vec::new()),
@@ -2212,6 +2318,153 @@ impl AuroraDaemonState {
             briefs_generados,
             total_en_cola,
         })
+    }
+
+    /// Devuelve disponibilidad de YouTube Shorts / Meta Reels, cola programada y publicaciones orgánicas.
+    pub fn obtener_estado_organico(&self) -> PulseOrganicoResponse {
+        PulseOrganicoResponse {
+            habilitado_en_scheduler: self.config.scheduler.publicacion_organica_habilitada,
+            publicadores: self.gestor_organico.estado_publicadores(),
+            cola_programada: self.cola_organica.lock().clone(),
+            publicaciones_realizadas: self.gestor_organico.historial(),
+        }
+    }
+
+    /// Publica o programa un Reel orgánico (Carril Verde) validando cero PII e integridad SHA-256.
+    #[tracing::instrument(skip(self, req), fields(plataforma = req.plataforma.etiqueta()))]
+    pub async fn publicar_reel_organico(
+        &self,
+        req: PublicarOrganicoRequest,
+    ) -> DaemonResult<PublicarOrganicoResponse> {
+        let ahora = Utc::now();
+        if let Some(fecha_prog) = req.solicitud.programado_para {
+            if fecha_prog > ahora {
+                let _bytes = validar_solicitud_organica(&req.solicitud).await?;
+                let entrada = PublicacionOrganicaProgramada {
+                    id: Uuid::new_v4(),
+                    plataforma: req.plataforma,
+                    solicitud: req.solicitud,
+                    encolada_en: ahora,
+                };
+                self.cola_organica.lock().push(entrada);
+                return Ok(PublicarOrganicoResponse {
+                    encolado: true,
+                    comprobante: None,
+                    programado_para: Some(fecha_prog),
+                });
+            }
+        }
+
+        let comprobante = self
+            .gestor_organico
+            .publicar(req.plataforma, &req.solicitud, &self.telemetria)
+            .await?;
+
+        self.emitir_evento(
+            "ReelOrganicoPublicado",
+            serde_json::json!({
+                "publicacion_id": comprobante.publicacion_id,
+                "plataforma": comprobante.plataforma.etiqueta(),
+                "url_publica": comprobante.url_publica,
+                "simulado": comprobante.simulado,
+            }),
+        );
+
+        Ok(PublicarOrganicoResponse {
+            encolado: false,
+            comprobante: Some(comprobante),
+            programado_para: None,
+        })
+    }
+
+    /// Procesa publicaciones orgánicas vencidas en la cola programada (Carril Verde AFK).
+    pub async fn procesar_cola_organica_pendiente(&self) -> u64 {
+        let ahora = Utc::now();
+        let vencidas: Vec<PublicacionOrganicaProgramada> = {
+            let mut cola = self.cola_organica.lock();
+            let mut listas = Vec::new();
+            let mut restantes = Vec::new();
+            for item in cola.drain(..) {
+                let vencido = item
+                    .solicitud
+                    .programado_para
+                    .is_none_or(|fecha| fecha <= ahora);
+                if vencido {
+                    listas.push(item);
+                } else {
+                    restantes.push(item);
+                }
+            }
+            *cola = restantes;
+            listas
+        };
+
+        let mut publicadas = 0_u64;
+        for item in vencidas {
+            match self
+                .gestor_organico
+                .publicar(item.plataforma, &item.solicitud, &self.telemetria)
+                .await
+            {
+                Ok(comp) => {
+                    publicadas += 1;
+                    self.emitir_evento(
+                        "ReelOrganicoPublicado",
+                        serde_json::json!({
+                            "publicacion_id": comp.publicacion_id,
+                            "plataforma": comp.plataforma.etiqueta(),
+                            "url_publica": comp.url_publica,
+                            "simulado": comp.simulado,
+                        }),
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        plataforma = item.plataforma.etiqueta(),
+                        "Error publicando entrada programada en cola orgánica; reencolando"
+                    );
+                    self.cola_organica.lock().push(item);
+                }
+            }
+        }
+        publicadas
+    }
+
+    /// Ejecuta las plazas OSINT configuradas en `[scheduler].plazas_osint` (Carril Verde AFK).
+    pub async fn ejecutar_hunts_programados_afk(&self) -> u64 {
+        if !self.config.scheduler.hunt_programado_habilitado {
+            return 0;
+        }
+        let mut ejecutadas = 0_u64;
+        for plaza in self.config.scheduler.plazas_osint.clone() {
+            let req = HuntRequest {
+                vertical: plaza.vertical,
+                ciudad: plaza.ciudad,
+                estado: plaza.estado,
+                zona: plaza.zona,
+                palabras_clave: plaza.palabras_clave,
+                limite_resultados: plaza.limite_resultados,
+                requiere_js: Some(false),
+                fuente_url: None,
+                fuente_formato: None,
+                registros_semilla: None,
+            };
+            match self.ejecutar_hunt(req).await {
+                Ok(resp) => {
+                    ejecutadas += 1;
+                    info!(
+                        campana_id = %resp.campana_id,
+                        ingestados = resp.prospectos_ingestados,
+                        "Cacería OSINT programada (Carril Verde AFK) completada"
+                    );
+                }
+                Err(err) => {
+                    warn!(error = %err, "Error controlado en cacería OSINT programada AFK");
+                }
+            }
+        }
+        ejecutadas
     }
 
     fn guardar_orden_forge(&self, dto: RegistroOrdenForjaDto) -> DaemonResult<()> {

@@ -13,6 +13,7 @@ pub mod dpo_loop;
 pub mod error;
 pub mod rate_limiter;
 pub mod smtp_transport;
+pub mod social_publisher;
 pub mod telemetry;
 pub mod warmup;
 
@@ -29,6 +30,13 @@ pub use rate_limiter::{
     ControladorTasaPlataforma, EstadoTasaPlataforma, PlataformaPulso, PoliticaTasaPlataforma,
 };
 pub use smtp_transport::{ConfigSmtp, SmtpEmailTransport};
+pub use social_publisher::{
+    validar_solicitud_organica, ComprobantePublicacionOrganica, ConfigMetaReels,
+    ConfigYouTubeShorts, DeterministicMockSocialPublisher, EstadoPublicadorOrganico,
+    GestorPublicacionOrganica, MetaReelsGraphPublisher, OrganicSocialPublisher,
+    SolicitudPublicacionOrganica, YouTubeShortsApiPublisher, DEFAULT_META_GRAPH_BASE_URL,
+    DEFAULT_YOUTUBE_UPLOAD_URL,
+};
 pub use telemetry::{
     EventoTelemetria, RecolectorTelemetria, ResumenGanchoTelemetria, TipoEventoTelemetria,
 };

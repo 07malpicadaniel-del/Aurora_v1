@@ -62,12 +62,20 @@ async fn main() -> ExitCode {
         }
     };
 
+    if config.es_bind_remoto_o_tailscale() && config.mobile_token_activo().is_none() {
+        warn!(
+            bind_addr = %config.bind_addr,
+            "aurora-daemon enlazado fuera de loopback sin AURORA_MOBILE_TOKEN; define un Bearer token para acceso seguro vía Tailscale"
+        );
+    }
+
     info!(
         bind_addr = %config.bind_addr,
         bob_url = %config.bob_url,
         bob_slot_id = config.bob_slot_id,
         modo_ejecucion = config.modo_efectivo().etiqueta(),
-        "aurora-daemon escuchando para Cockpit axis_v1 y automatizaciones locales"
+        bearer_auth = config.mobile_token_activo().is_some(),
+        "aurora-daemon escuchando para Cockpit axis_v1 y Portal Móvil /mobile"
     );
 
     let scheduler_handle = iniciar_scheduler_dpo(Arc::clone(&state));

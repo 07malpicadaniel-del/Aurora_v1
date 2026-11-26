@@ -1,0 +1,26 @@
+[Unit]
+Description=BOB Local LLM Server (llama.cpp CUDA slot_id=0 on 127.0.0.1:8086)
+Documentation=https://github.com/07malpicadaniel-del/Aurora_v1
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/sandbox_bob/engine/llama.cpp
+Environment=LD_LIBRARY_PATH=%h/sandbox_bob/engine/llama.cpp/build/bin
+# Modelo residente estable (<11 GB VRAM con holgura para NVENC en RTX 5060 Ti 16 GB).
+# Para Qwen 3.8 27B IQ3_S actualizar llama.cpp con soporte MTP qwen35 o usar variante noMTP.
+ExecStart=%h/sandbox_bob/engine/llama.cpp/build/bin/llama-server \
+  -m %h/sandbox_bob/engine/llama.cpp/models/gemma-3-12b-it-Q4_K_M.gguf \
+  --host 127.0.0.1 \
+  --port 8086 \
+  -ngl 99 \
+  -c 4096 \
+  --parallel 1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+KillSignal=SIGTERM
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

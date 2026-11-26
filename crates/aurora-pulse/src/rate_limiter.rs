@@ -17,8 +17,10 @@ pub enum PlataformaPulso {
     WhatsApp,
     /// Interacción y mensajes en LinkedIn.
     LinkedIn,
-    /// Interacción en Instagram.
+    /// Interacción en Instagram / Meta Reels.
     Instagram,
+    /// Publicación orgánica vertical en YouTube Shorts.
+    YouTubeShorts,
     /// Interacción pública en X.
     X,
     /// Llamada directa asistida.
@@ -36,6 +38,7 @@ impl PlataformaPulso {
             Self::WhatsApp => "WhatsApp",
             Self::LinkedIn => "LinkedIn",
             Self::Instagram => "Instagram",
+            Self::YouTubeShorts => "YouTubeShorts",
             Self::X => "X",
             Self::LlamadaDirecta => "LlamadaDirecta",
             Self::CamaraEmpresarial => "CamaraEmpresarial",
@@ -50,6 +53,7 @@ impl PlataformaPulso {
             Self::WhatsApp,
             Self::LinkedIn,
             Self::Instagram,
+            Self::YouTubeShorts,
             Self::X,
             Self::LlamadaDirecta,
             Self::CamaraEmpresarial,
@@ -132,6 +136,14 @@ impl PoliticaTasaPlataforma {
                 jitter_max_ms: 10_000,
                 umbral_fallos_circuit_breaker: 3,
                 enfriamiento_circuit_breaker_s: 2_400,
+            },
+            PlataformaPulso::YouTubeShorts => Self {
+                cuota_max_hora: 4,
+                cuota_max_dia: 12,
+                intervalo_minimo_ms: 60_000,
+                jitter_max_ms: 15_000,
+                umbral_fallos_circuit_breaker: 3,
+                enfriamiento_circuit_breaker_s: 3_600,
             },
             PlataformaPulso::LlamadaDirecta | PlataformaPulso::CamaraEmpresarial => Self {
                 cuota_max_hora: 10,

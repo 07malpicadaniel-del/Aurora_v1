@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="es-MX">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+<title>Aurora v2 · Revisión Móvil (Carril Ámbar)</title>
+<style>
+  :root {
+    --bg: #09090b;
+    --surface: #18181b;
+    --border: #27272a;
+    --text: #f4f4f5;
+    --muted: #a1a1aa;
+    --ok: #10b981;
+    --err: #ef4444;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+    font-size: 14px;
+    line-height: 1.45;
+    padding: 16px 14px 48px;
+    max-width: 680px;
+    margin: 0 auto;
+  }
+  header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 16px;
+  }
+  h1 { font-size: 16px; font-weight: 700; letter-spacing: -0.01em; }
+  h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 10px; }
+  .sub { font-size: 12px; color: var(--muted); }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+    margin-bottom: 14px;
+  }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .grid-2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .metric {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px;
+  }
+  .metric .label { font-size: 11px; color: var(--muted); display: block; }
+  .metric .val { font-size: 15px; font-weight: 700; font-family: ui-monospace, monospace; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 999px; margin-right: 6px; }
+  .dot-ok { background: var(--ok); }
+  .dot-err { background: var(--err); }
+  .dot-idle { background: #71717a; }
+  button {
+    appearance: none;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 9px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button.primary { background: #ffffff; color: #000000; border-color: #ffffff; }
+  button.danger { border-color: #7f1d1d; color: #fca5a5; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  input[type="password"], input[type="text"] {
+    width: 100%;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 13px;
+  }
+  .item {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px;
+    margin-bottom: 8px;
+  }
+  .item:last-child { margin-bottom: 0; }
+  .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 11px; color: var(--muted); }
+  .msg { padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); margin-bottom: 12px; font-size: 12px; }
+  .msg-ok { border-color: #065f46; }
+  .msg-err { border-color: #7f1d1d; color: #fca5a5; }
+  .hidden { display: none; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .chk { width: 16px; height: 16px; accent-color: #ffffff; }
+</style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Aurora v2 · Carril Ámbar</h1>
+      <div class="sub" id="status-line"><span class="dot dot-idle"></span>Conectando...</div>
+    </div>
+    <div style="display:flex;gap:6px;">
+      <button type="button" id="btn-auth">Token</button>
+      <button type="button" class="primary" id="btn-refresh">Actualizar</button>
+    </div>
+  </header>
+
+  <div id="feedback" class="msg hidden"></div>
+
+  <section id="auth-box" class="card hidden">
+    <h2>Acceso Seguro Tailscale</h2>
+    <p class="sub" style="margin-bottom:8px;">Introduce el token Bearer configurado en AURORA_MOBILE_TOKEN.</p>
+    <div style="display:flex;gap:8px;">
+      <input type="password" id="token-input" placeholder="Token Bearer" autocomplete="off" />
+      <button type="button" class="primary" id="btn-save-token">Guardar</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Sistema y Consejo Multi-Agente</h2>
+    <div class="grid-2" id="health-grid" style="margin-bottom:10px;"></div>
+    <div id="council-list"></div>
+  </section>
+
+  <section class="card">
+    <div class="row" style="margin-bottom:10px;">
+      <h2 style="margin:0;">Sala Gatekeeper (<span id="gk-count">0</span>)</h2>
+      <div style="display:flex;gap:6px;">
+        <button type="button" class="danger" id="btn-batch-reject" disabled>Descartar lote</button>
+        <button type="button" class="primary" id="btn-batch-approve" disabled>Aprobar lote</button>
+      </div>
+    </div>
+    <div id="gk-list" class="sub">Sin propuestas pendientes.</div>
+  </section>
+
+  <section class="card">
+    <h2>Forja Git (Pendiente Revisión Humana)</h2>
+    <div id="forge-list" class="sub">Sin ramas forge/* pendientes.</div>
+  </section>
+
+  <section class="card">
+    <h2>Briefs Pendientes Higgsfield</h2>
+    <div id="broll-list" class="sub">Sin briefs pendientes.</div>
+  </section>
+
+<script>
+(function () {
+  const TOKEN_KEY = 'aurora_mobile_bearer_token';
+  const selectedIds = new Set();
+
+  function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
+  function setToken(v) {
+    if (v && v.trim()) localStorage.setItem(TOKEN_KEY, v.trim());
+    else localStorage.removeItem(TOKEN_KEY);
+  }
+
+  function esc(str) {
+    return String(str == null ? '' : str)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function showMsg(kind, text) {
+    const el = document.getElementById('feedback');
+    el.className = 'msg ' + (kind === 'err' ? 'msg-err' : 'msg-ok');
+    el.textContent = text;
+  }
+
+  async function api(path, opts) {
+    const headers = Object.assign({ 'Accept': 'application/json' }, (opts && opts.headers) || {});
+    const tok = getToken();
+    if (tok) headers['Authorization'] = 'Bearer ' + tok;
+    const res = await fetch(path, Object.assign({}, opts || {}, { headers }));
+    if (res.status === 401) {
+      document.getElementById('auth-box').classList.remove('hidden');
+      throw new Error('Autenticación requerida (401). Ingresa AURORA_MOBILE_TOKEN.');
+    }
+    const text = await res.text();
+    let json = null;
+    try { json = text ? JSON.parse(text) : null; } catch (_) {}
+    if (!res.ok) {
+      throw new Error((json && (json.detalle || json.error)) || ('HTTP ' + res.status));
+    }
+    return json;
+  }
+
+  function updateBatchButtons() {
+    const empty = selectedIds.size === 0;
+    document.getElementById('btn-batch-approve').disabled = empty;
+    document.getElementById('btn-batch-reject').disabled = empty;
+  }
+
+  async function approveOne(id) {
+    await api('/api/v1/gatekeeper/aprobar/' + encodeURIComponent(id), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ despachar_inmediatamente: false })
+    });
+  }
+
+  async function rejectOne(id) {
+    await api('/api/v1/gatekeeper/rechazar/' + encodeURIComponent(id), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ motivo: 'Descartado en revisión móvil rápida' })
+    });
+  }
+
+  async function loadAll() {
+    try {
+      const [health, cuotas, gk, forge, broll] = await Promise.all([
+        api('/api/v1/health'),
+        api('/api/v1/council/cuotas'),
+        api('/api/v1/gatekeeper/pendientes'),
+        api('/api/v1/forge/ordenes'),
+        api('/api/v1/factory/broll')
+      ]);
+
+      document.getElementById('auth-box').classList.add('hidden');
+      document.getElementById('status-line').innerHTML =
+        '<span class="dot ' + (health.bob_online ? 'dot-ok' : 'dot-err') + '"></span>' +
+        'Daemon activo · BOB ' + (health.bob_online ? 'en línea (slot 0)' : 'en respaldo');
+
+      document.getElementById('health-grid').innerHTML =
+        '<div class="metric"><span class="label">Prospectos 4D</span><span class="val">' + esc(health.nodos_4d) + '</span></div>' +
+        '<div class="metric"><span class="label">Por aprobar</span><span class="val">' + esc(health.ordenes_pendientes) + '</span></div>';
+
+      const miembros = (cuotas && cuotas.miembros) || [];
+      document.getElementById('council-list').innerHTML = miembros.map(function (m) {
+        const dot = m.disponible ? 'dot-ok' : 'dot-err';
+        const uso = m.ilimitado ? 'Ilimitado (local)' : (m.usado_ventana_5h + '/' + m.limite_ventana_5h + ' (5h) · ' + m.usado_diario + '/' + m.limite_diario + ' (24h)');
+        return '<div class="item row"><div><span class="dot ' + dot + '"></span><strong>' + esc(m.miembro) + '</strong></div><span class="mono">' + esc(uso) + '</span></div>';
+      }).join('');
+
+      const ordenes = (gk && gk.ordenes) || [];
+      document.getElementById('gk-count').textContent = String(ordenes.length);
+      selectedIds.clear();
+      updateBatchButtons();
+
+      const gkEl = document.getElementById('gk-list');
+      if (ordenes.length === 0) {
+        gkEl.innerHTML = '<div class="sub">Sin propuestas pendientes en Sala Gatekeeper.</div>';
+      } else {
+        gkEl.innerHTML = ordenes.map(function (o) {
+          return '<div class="item" data-id="' + esc(o.orden_id) + '">' +
+            '<div class="row">' +
+              '<label style="display:flex;align-items:center;gap:8px;">' +
+                '<input type="checkbox" class="chk gk-chk" data-id="' + esc(o.orden_id) + '" />' +
+                '<strong>' + esc(o.prospecto_nombre) + '</strong>' +
+              '</label>' +
+              '<span class="mono">' + esc(o.ubicacion) + '</span>' +
+            '</div>' +
+            '<p style="margin-top:6px;font-size:13px;">' + esc(o.brief_creativo && o.brief_creativo.gancho_3s) + '</p>' +
+            '<p class="sub" style="margin-top:4px;">' + esc(o.diagnostico && o.diagnostico.producto_gancho) + '</p>' +
+            '<div class="actions">' +
+              '<button type="button" class="primary btn-one-ok" data-id="' + esc(o.orden_id) + '">Aprobar</button>' +
+              '<button type="button" class="danger btn-one-no" data-id="' + esc(o.orden_id) + '">Descartar</button>' +
+            '</div>' +
+          '</div>';
+        }).join('');
+
+        gkEl.querySelectorAll('.gk-chk').forEach(function (chk) {
+          chk.addEventListener('change', function () {
+            if (chk.checked) selectedIds.add(chk.dataset.id);
+            else selectedIds.delete(chk.dataset.id);
+            updateBatchButtons();
+          });
+        });
+        gkEl.querySelectorAll('.btn-one-ok').forEach(function (b) {
+          b.addEventListener('click', async function () {
+            try {
+              b.disabled = true;
+              await approveOne(b.dataset.id);
+              showMsg('ok', 'Propuesta aprobada y archivos generados.');
+              await loadAll();
+            } catch (e) { showMsg('err', e.message); b.disabled = false; }
+          });
+        });
+        gkEl.querySelectorAll('.btn-one-no').forEach(function (b) {
+          b.addEventListener('click', async function () {
+            try {
+              b.disabled = true;
+              await rejectOne(b.dataset.id);
+              showMsg('ok', 'Propuesta descartada.');
+              await loadAll();
+            } catch (e) { showMsg('err', e.message); b.disabled = false; }
+          });
+        });
+      }
+
+      const ramas = (forge && forge.ramas_forge) || [];
+      const ordenesForge = ((forge && forge.ordenes) || []).filter(function (x) {
+        return x.orden && x.orden.estado === 'PendienteRevisionHumana';
+      });
+      const forgeEl = document.getElementById('forge-list');
+      if (ramas.length === 0 && ordenesForge.length === 0) {
+        forgeEl.innerHTML = '<div class="sub">Sin ramas forge/* esperando revisión humana.</div>';
+      } else {
+        const htmlRamas = ramas.map(function (r) {
+          return '<div class="item row"><span class="mono">' + esc(r) + '</span><span class="sub">Pendiente revisión</span></div>';
+        }).join('');
+        forgeEl.innerHTML = htmlRamas || ordenesForge.map(function (o) {
+          return '<div class="item"><strong>' + esc(o.reporte && o.reporte.rama_forge) + '</strong><p class="sub">' + esc(o.orden.descripcion_tecnica) + '</p></div>';
+        }).join('');
+      }
+
+      const briefs = ((broll && broll.briefs_higgsfield) || []).filter(function (b) {
+        return b.estado === 'PendienteGeneracion';
+      });
+      const brollEl = document.getElementById('broll-list');
+      if (briefs.length === 0) {
+        brollEl.innerHTML = '<div class="sub">Clips registrados: ' + esc((broll && broll.total_clips) || 0) + ' · Sin briefs pendientes.</div>';
+      } else {
+        brollEl.innerHTML = briefs.map(function (b) {
+          return '<div class="item">' +
+            '<div class="row"><span class="mono">' + esc(b.movimiento_camara) + ' · ' + esc(b.duracion_objetivo_seg) + 's</span>' +
+            '<button type="button" class="btn-copy" data-prompt="' + esc(b.escena_visual_en) + '">Copiar prompt</button></div>' +
+            '<p class="sub" style="margin-top:6px;">' + esc(b.escena_visual_en) + '</p>' +
+          '</div>';
+        }).join('');
+        brollEl.querySelectorAll('.btn-copy').forEach(function (b) {
+          b.addEventListener('click', function () {
+            if (navigator.clipboard) navigator.clipboard.writeText(b.dataset.prompt || '');
+            showMsg('ok', 'Prompt cinematográfico copiado.');
+          });
+        });
+      }
+    } catch (err) {
+      document.getElementById('status-line').innerHTML = '<span class="dot dot-err"></span>' + esc(err.message);
+      showMsg('err', err.message);
+    }
+  }
+
+  document.getElementById('btn-refresh').addEventListener('click', loadAll);
+  document.getElementById('btn-auth').addEventListener('click', function () {
+    document.getElementById('auth-box').classList.toggle('hidden');
+    document.getElementById('token-input').value = getToken();
+  });
+  document.getElementById('btn-save-token').addEventListener('click', function () {
+    setToken(document.getElementById('token-input').value);
+    loadAll();
+  });
+  document.getElementById('btn-batch-approve').addEventListener('click', async function () {
+    const ids = Array.from(selectedIds);
+    for (const id of ids) {
+      try { await approveOne(id); } catch (e) { showMsg('err', e.message); return; }
+    }
+    showMsg('ok', 'Lote aprobado: ' + ids.length + ' propuestas.');
+    await loadAll();
+  });
+  document.getElementById('btn-batch-reject').addEventListener('click', async function () {
+    const ids = Array.from(selectedIds);
+    for (const id of ids) {
+      try { await rejectOne(id); } catch (e) { showMsg('err', e.message); return; }
+    }
+    showMsg('ok', 'Lote descartado: ' + ids.length + ' propuestas.');
+    await loadAll();
+  });
+
+  loadAll();
+})();
+</script>
+</body>
+</html>

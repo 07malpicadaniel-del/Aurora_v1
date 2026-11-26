@@ -95,3 +95,23 @@ habilitado = true
 worktrees_dir = "~/.local/share/aurora/forge_worktrees"
 # repo_root = "/ruta/al/repositorio/Aurora_v1"
 timeout_segundos = 300
+
+[scheduler]
+# Orquestador AFK 24/7 de Carril Verde (sin PII ni envíos en frío automáticos)
+hunt_programado_habilitado = false
+hunt_intervalo_minutos = 360
+publicacion_organica_habilitada = false
+organico_intervalo_minutos = 120
+# Ejemplo de plaza programada (activar solo con hunt_programado_habilitado = true):
+# [[scheduler.plazas_osint]]
+# ciudad = "Monterrey"
+# estado = "Nuevo León"
+# zona = "Apodaca Industrial"
+# vertical = { Inmobiliaria = "ComercialIndustrial" }
+# palabras_clave = ["nave industrial", "parque logístico"]
+# limite_resultados = 10
+
+# Portal móvil seguro sobre Tailscale (`GET /mobile`):
+# Si cambias bind_addr a tu IP Tailscale (ej. "100.x.y.z:8090"), define AURORA_MOBILE_TOKEN en secrets.env.
+# Publicación orgánica oficial (inyectar vía ~/.config/aurora/secrets.env):
+# AURORA_YOUTUBE_ACCESS_TOKEN, AURORA_META_IG_USER_ID, AURORA_META_ACCESS_TOKEN, AURORA_META_MEDIA_BASE_URL

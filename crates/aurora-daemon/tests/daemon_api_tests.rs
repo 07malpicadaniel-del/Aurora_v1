@@ -8,17 +8,20 @@ use aurora_daemon::{
     BrollEstadoResponse, CouncilCuotasResponse, CrearOrdenForjaRequest, DelegarConsejoRequest,
     DpoConsolidarResponse, ForgeOrdenesResponse, GatekeeperPendientesResponse,
     GenerarBriefsHiggsfieldRequest, GenerarBriefsHiggsfieldResponse, HealthResponse, HuntRequest,
-    HuntResponse, OptOutRequest, OptOutResponse, OrdenPendienteDto, PulseEstadoResponse,
-    RechazarOrdenRequest, RegistrarClipBrollRequest, TelaranaResponse,
+    HuntResponse, OptOutRequest, OptOutResponse, OrdenPendienteDto, PublicarOrganicoRequest,
+    PublicarOrganicoResponse, PulseEstadoResponse, PulseOrganicoResponse, RechazarOrdenRequest,
+    RegistrarClipBrollRequest, TelaranaResponse,
 };
 use aurora_domain::{
     EstadoAprobacion, PerfilPsicologico, SubverticalInmobiliaria, Ubicacion, VerticalComercial,
 };
-use aurora_factory::{ClipBroll, EstadoBriefHiggsfield};
+use aurora_factory::{sha256_bytes, ClipBroll, EstadoBriefHiggsfield};
 use aurora_forge::TipoOrdenIngenieria;
 use aurora_memory::{IslaVertical, SubgrafoProspecto};
 use aurora_osint::{CoMencionCruda, FormatoCrudo, RegistroCrudo};
-use aurora_pulse::{EventoTelemetria, TipoEventoTelemetria};
+use aurora_pulse::{
+    EventoTelemetria, PlataformaPulso, SolicitudPublicacionOrganica, TipoEventoTelemetria,
+};
 use chrono::Utc;
 use reqwest::{Client, StatusCode};
 use tokio::net::TcpListener;
@@ -556,6 +559,111 @@ async fn endpoints_http_factory_broll_briefs_y_registro_mp4(
         .briefs_higgsfield
         .iter()
         .any(|b| b.id == primer_brief_id && b.estado == EstadoBriefHiggsfield::Importado));
+
+    server_handle.abort();
+    let _ = fs::remove_dir_all(&base_dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn portal_mobile_auth_bearer_y_publicacion_organica_http(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base_dir = dir_temporal_daemon("aurora_daemon_mobile_organic_test");
+    let token_secreto = "aurora-tailscale-token-2026".to_string();
+    let state =
+        AuroraDaemonState::para_pruebas_offline_con_token(&base_dir, Some(token_secreto.clone()))?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let base_url = format!("http://{addr}");
+    let router = crear_router(state);
+    let server_handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let client = Client::new();
+
+    // 1. GET /mobile sirve el HTML autocontenido monocromático sin bloquear navegador móvil
+    let mobile_resp = client.get(format!("{base_url}/mobile")).send().await?;
+    assert_eq!(mobile_resp.status(), StatusCode::OK);
+    let html = mobile_resp.text().await?;
+    assert!(html.contains("Aurora v2 · Carril Ámbar"));
+    assert!(html.contains("Sala Gatekeeper"));
+
+    // 2. /api/v1/* rechaza solicitudes sin token o con token incorrecto (401 UNAUTHORIZED)
+    let sin_token = client.get(format!("{base_url}/api/v1/health")).send().await?;
+    assert_eq!(sin_token.status(), StatusCode::UNAUTHORIZED);
+
+    let token_malo = client
+        .get(format!("{base_url}/api/v1/pulse/organico"))
+        .bearer_auth("token-invalido")
+        .send()
+        .await?;
+    assert_eq!(token_malo.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. Con Bearer válido, GET /api/v1/pulse/organico y POST /api/v1/pulse/organico/publicar funcionan
+    let estado_org: PulseOrganicoResponse = client
+        .get(format!("{base_url}/api/v1/pulse/organico"))
+        .bearer_auth(&token_secreto)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(estado_org.publicadores.len(), 2);
+    assert!(estado_org.publicaciones_realizadas.is_empty());
+
+    let clip_mp4 = base_dir.join("reel_organico_carril_verde.mp4");
+    let mut mp4 = Vec::new();
+    mp4.extend_from_slice(&24_u32.to_be_bytes());
+    mp4.extend_from_slice(b"ftyp");
+    mp4.extend_from_slice(b"isom");
+    mp4.extend_from_slice(&512_u32.to_be_bytes());
+    mp4.extend_from_slice(b"isom");
+    mp4.extend_from_slice(b"mp42");
+    fs::write(&clip_mp4, &mp4)?;
+    let hash_mp4 = sha256_bytes(&mp4);
+
+    let pub_resp: PublicarOrganicoResponse = client
+        .post(format!("{base_url}/api/v1/pulse/organico/publicar"))
+        .bearer_auth(&token_secreto)
+        .json(&PublicarOrganicoRequest {
+            plataforma: PlataformaPulso::YouTubeShorts,
+            solicitud: SolicitudPublicacionOrganica {
+                campana_id: Uuid::new_v4(),
+                vertical: VerticalComercial::Inmobiliaria(
+                    SubverticalInmobiliaria::ComercialIndustrial,
+                ),
+                titulo: "Claves de plusvalía industrial en Monterrey 2026".to_string(),
+                descripcion: "Análisis educativo sobre parques Clase A y absorción logística."
+                    .to_string(),
+                hashtags: vec!["Nearshoring".to_string(), "Monterrey".to_string()],
+                ruta_mp4: clip_mp4,
+                sha256_mp4: hash_mp4.clone(),
+                programado_para: None,
+                libre_de_pii: true,
+            },
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(!pub_resp.encolado);
+    let comp = pub_resp
+        .comprobante
+        .ok_or("se esperaba comprobante de publicación orgánica")?;
+    assert_eq!(comp.plataforma, PlataformaPulso::YouTubeShorts);
+    assert_eq!(comp.sha256_mp4, hash_mp4);
+
+    let estado_org_post: PulseOrganicoResponse = client
+        .get(format!("{base_url}/api/v1/pulse/organico"))
+        .bearer_auth(&token_secreto)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(estado_org_post.publicaciones_realizadas.len(), 1);
 
     server_handle.abort();
     let _ = fs::remove_dir_all(&base_dir);
