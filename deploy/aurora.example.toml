@@ -48,6 +48,11 @@ cdp_url = "http://127.0.0.1:9222"
 ffmpeg_bin = "ffmpeg"
 usar_nvenc = true
 
+[factory]
+# Biblioteca local en NVMe de clips maestros B-Roll (Higgsfield) sin texto ni voz + cola de briefs
+# Override por entorno: AURORA_BROLL_DIR
+broll_dir = "~/.local/share/aurora/assets/broll"
+
 [smtp]
 # Activa el transporte real tokio1-rustls-tls tras aprobación Gatekeeper y correo destino
 habilitado = false

@@ -125,6 +125,7 @@ dependencies = [
  "aurora-osint",
  "chrono",
  "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

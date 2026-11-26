@@ -21,11 +21,12 @@ use aurora_domain::{
     TipoVinculo, Ubicacion, VerticalComercial,
 };
 use aurora_factory::{
-    ConfigFabrica, ConfigFfmpeg, ConfigHeadlessBrowser, ConfigPiperCpu,
-    DeterministicMockDocumentEngine, DeterministicMockVideoComposer, DeterministicSilentWavEngine,
-    DocumentEngine, FabricaMultimodalAurora, FfmpegNvencComposer, HeadlessBrowserDocumentEngine,
+    validar_ruta_sin_traversal, BibliotecaBroll, BriefHiggsfield, ClipBroll, ConfigFabrica,
+    ConfigFfmpeg, ConfigHeadlessBrowser, ConfigPiperCpu, DeterministicMockDocumentEngine,
+    DeterministicMockVideoComposer, DeterministicSilentWavEngine, DocumentEngine,
+    FabricaMultimodalAurora, FfmpegNvencComposer, HeadlessBrowserDocumentEngine,
     PaqueteManufacturado, PiperCpuTtsEngine, ResultadoAudio, ResultadoVideo, SolicitudManufactura,
-    TtsEngine, VideoComposer,
+    SolicitudRegistroClipBroll, TtsEngine, VideoComposer,
 };
 use aurora_forge::{
     listar_ramas_forge, validar_rutas_permitidas, ComandoValidacion, ConfigSandboxForja,
@@ -127,6 +128,16 @@ impl DocumentEngine for DynDocumentEngine {
             .renderizar_frames_png(html_escenas, directorio_frames)
             .await
     }
+
+    async fn renderizar_overlays_transparentes(
+        &self,
+        html_overlays: &[String],
+        directorio_overlays: &Path,
+    ) -> aurora_factory::FactoryResult<Vec<PathBuf>> {
+        self.0
+            .renderizar_overlays_transparentes(html_overlays, directorio_overlays)
+            .await
+    }
 }
 
 /// Envoltorio object-safe sobre [`VideoComposer`].
@@ -144,6 +155,19 @@ impl VideoComposer for DynVideoComposer {
     ) -> aurora_factory::FactoryResult<ResultadoVideo> {
         self.0
             .ensamblar_reel_vertical(frames, audio_wav, srt, salida_mp4)
+            .await
+    }
+
+    async fn ensamblar_reel_con_broll(
+        &self,
+        clips_broll: &[PathBuf],
+        overlays_png: &[PathBuf],
+        audio_wav: &Path,
+        srt: &Path,
+        salida_mp4: &Path,
+    ) -> aurora_factory::FactoryResult<ResultadoVideo> {
+        self.0
+            .ensamblar_reel_con_broll(clips_broll, overlays_png, audio_wav, srt, salida_mp4)
             .await
     }
 }
@@ -596,6 +620,74 @@ pub struct CrearOrdenForjaRequest {
     pub repo_root: Option<PathBuf>,
 }
 
+/// Respuesta de `GET /api/v1/factory/broll`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrollEstadoResponse {
+    /// Directorio NVMe configurado para la biblioteca B-Roll.
+    pub broll_dir: PathBuf,
+    /// Número total de clips maestros registrados.
+    pub total_clips: usize,
+    /// Conteo de clips disponibles agrupado por vertical comercial.
+    pub clips_por_vertical: BTreeMap<String, usize>,
+    /// Inventario completo de clips B-Roll y sus usos acumulados.
+    pub clips: Vec<ClipBroll>,
+    /// Verticales comerciales con menos de 3 clips maestros (brechas de cobertura).
+    pub brechas_cobertura: Vec<VerticalComercial>,
+    /// Cola de briefs cinematográficos generados para Higgsfield.
+    pub briefs_higgsfield: Vec<BriefHiggsfield>,
+}
+
+/// Solicitud para `POST /api/v1/factory/broll/registrar`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistrarClipBrollRequest {
+    /// Ruta local del clip `.mp4`/`.mov` descargado de Higgsfield (sin *path traversal*).
+    pub ruta_origen: PathBuf,
+    /// Vertical comercial correspondiente al clip.
+    pub vertical: VerticalComercial,
+    /// Perfil psicológico objetivo opcional.
+    #[serde(default)]
+    pub perfil_objetivo: Option<PerfilPsicologico>,
+    /// Etiquetas semánticas opcionales.
+    #[serde(default)]
+    pub etiquetas: Vec<String>,
+    /// Duración en milisegundos (opcional, por defecto 5000 ms).
+    #[serde(default)]
+    pub duracion_ms: Option<u64>,
+    /// Ancho del clip en píxeles (opcional, por defecto 1080).
+    #[serde(default)]
+    pub ancho: Option<u32>,
+    /// Alto del clip en píxeles (opcional, por defecto 1920).
+    #[serde(default)]
+    pub alto: Option<u32>,
+    /// Movimiento de cámara cinematográfico (opcional, por defecto `dolly_in_slow`).
+    #[serde(default)]
+    pub movimiento_camara: Option<String>,
+    /// Brief Higgsfield opcional a marcar como `Importado` tras registrar el clip.
+    #[serde(default)]
+    pub brief_id: Option<Uuid>,
+}
+
+/// Solicitud para `POST /api/v1/factory/broll/briefs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerarBriefsHiggsfieldRequest {
+    /// Vertical comercial objetivo.
+    pub vertical: VerticalComercial,
+    /// Perfil psicológico objetivo.
+    pub perfil_objetivo: PerfilPsicologico,
+    /// Cantidad de briefs cinematográficos a generar (`1..=10`, por defecto `3`).
+    #[serde(default)]
+    pub cantidad: Option<usize>,
+}
+
+/// Respuesta de `POST /api/v1/factory/broll/briefs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerarBriefsHiggsfieldResponse {
+    /// Nuevos briefs creados y persistidos en NVMe.
+    pub briefs_generados: Vec<BriefHiggsfield>,
+    /// Total acumulado en la cola de Higgsfield.
+    pub total_en_cola: usize,
+}
+
 /// Evento emitido en tiempo real hacia `/api/v1/eventos/stream`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventoDaemon {
@@ -653,6 +745,7 @@ pub struct AuroraDaemonState {
     osint_fuentes: RwLock<Vec<Arc<dyn OsintSource>>>,
     bob_slot_lock: Arc<tokio::sync::Mutex<()>>,
     orquestador: OrquestadorComercialBob<DynBobBackend>,
+    broll: Arc<tokio::sync::Mutex<BibliotecaBroll>>,
     fabrica: FabricaMultimodalAurora<DynTtsEngine, DynDocumentEngine, DynVideoComposer>,
     rate_limiter: Arc<ControladorTasaPlataforma>,
     warmup_gestor: GestorCalentamientoPeriferico<DynWarmupDriver>,
@@ -929,6 +1022,9 @@ impl AuroraDaemonState {
         } else {
             Vec::new()
         };
+        let broll = Arc::new(tokio::sync::Mutex::new(BibliotecaBroll::abrir(
+            config.broll_dir_efectivo(),
+        )?));
         let fabrica = FabricaMultimodalAurora::new(
             ConfigFabrica {
                 directorio_base: factory_dir,
@@ -936,7 +1032,8 @@ impl AuroraDaemonState {
             DynTtsEngine(tts_engine),
             DynDocumentEngine(doc_engine),
             DynVideoComposer(video_composer),
-        );
+        )
+        .con_biblioteca_broll(Arc::clone(&broll));
         let warmup_gestor = GestorCalentamientoPeriferico::new(
             DynWarmupDriver(warmup_driver),
             Arc::clone(&rate_limiter),
@@ -978,6 +1075,7 @@ impl AuroraDaemonState {
             osint_fuentes: RwLock::new(fuentes_iniciales),
             bob_slot_lock,
             orquestador,
+            broll,
             fabrica,
             rate_limiter,
             warmup_gestor,
@@ -2033,6 +2131,87 @@ impl AuroraDaemonState {
                 Err(DaemonError::Forja(err))
             }
         }
+    }
+
+    /// Devuelve el inventario completo de la biblioteca B-Roll, usos, brechas y briefs Higgsfield.
+    pub async fn obtener_estado_broll(&self) -> BrollEstadoResponse {
+        let bib = self.broll.lock().await;
+        BrollEstadoResponse {
+            broll_dir: bib.directorio_raiz().to_path_buf(),
+            total_clips: bib.indice().clips.len(),
+            clips_por_vertical: bib.conteo_por_vertical(),
+            clips: bib.indice().clips.clone(),
+            brechas_cobertura: bib.detectar_brechas_cobertura(),
+            briefs_higgsfield: bib.cola_briefs().briefs.clone(),
+        }
+    }
+
+    /// Importa y valida un clip `.mp4`/`.mov` local descargado de Higgsfield en la biblioteca NVMe.
+    #[tracing::instrument(skip(self, req), fields(vertical = req.vertical.etiqueta()))]
+    pub async fn registrar_clip_broll(
+        &self,
+        req: RegistrarClipBrollRequest,
+    ) -> DaemonResult<ClipBroll> {
+        validar_ruta_sin_traversal(&req.ruta_origen)?;
+        let ruta_resuelta = expandir_tilde_path(&req.ruta_origen);
+
+        let mut bib = self.broll.lock().await;
+        let clip = bib.registrar_clip(SolicitudRegistroClipBroll {
+            ruta_origen: ruta_resuelta,
+            vertical: req.vertical,
+            perfil_objetivo: req.perfil_objetivo,
+            etiquetas: req.etiquetas,
+            duracion_ms: req.duracion_ms.unwrap_or(5_000),
+            ancho: req.ancho.unwrap_or(1080),
+            alto: req.alto.unwrap_or(1920),
+            movimiento_camara: req
+                .movimiento_camara
+                .unwrap_or_else(|| "dolly_in_slow".to_string()),
+        })?;
+
+        if let Some(brief_id) = req.brief_id {
+            let _ = bib.marcar_brief_importado(brief_id, clip.id);
+        }
+
+        self.emitir_evento(
+            "ClipBrollRegistrado",
+            serde_json::json!({
+                "clip_id": clip.id,
+                "vertical": clip.vertical.etiqueta(),
+                "sha256": clip.sha256,
+            }),
+        );
+
+        Ok(clip)
+    }
+
+    /// Genera prompts cinematográficos estructurados para Higgsfield y los persiste en la cola NVMe.
+    #[tracing::instrument(skip(self, req), fields(vertical = req.vertical.etiqueta()))]
+    pub async fn generar_briefs_higgsfield(
+        &self,
+        req: GenerarBriefsHiggsfieldRequest,
+    ) -> DaemonResult<GenerarBriefsHiggsfieldResponse> {
+        let mut bib = self.broll.lock().await;
+        let briefs_generados = bib.generar_briefs_higgsfield(
+            req.vertical,
+            req.perfil_objetivo,
+            req.cantidad.unwrap_or(3),
+        )?;
+        let total_en_cola = bib.cola_briefs().briefs.len();
+
+        self.emitir_evento(
+            "BriefsHiggsfieldGenerados",
+            serde_json::json!({
+                "vertical": req.vertical.etiqueta(),
+                "generados": briefs_generados.len(),
+                "total_en_cola": total_en_cola,
+            }),
+        );
+
+        Ok(GenerarBriefsHiggsfieldResponse {
+            briefs_generados,
+            total_en_cola,
+        })
     }
 
     fn guardar_orden_forge(&self, dto: RegistroOrdenForjaDto) -> DaemonResult<()> {

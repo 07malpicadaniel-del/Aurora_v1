@@ -7,7 +7,8 @@ pub mod state;
 
 pub use config::{
     expandir_tilde_path, resolver_binario_en_sistema, AuroraDaemonConfig, ConfigCouncilDaemon,
-    ConfigForgeDaemon, EstadoSubsistema, ModoEjecucion, ReporteSubsistemas, SubsystemProbe,
+    ConfigFactoryDaemon, ConfigForgeDaemon, EstadoSubsistema, ModoEjecucion, ReporteSubsistemas,
+    SubsystemProbe,
 };
 pub use error::{DaemonError, DaemonResult};
 pub use routes::crear_router;
@@ -17,9 +18,10 @@ pub use scheduler::{
 };
 pub use state::{
     AprobarOrdenRequest, AprobarOrdenResponse, AristaTelaranaDto, AuroraDaemonState,
-    CouncilCuotasResponse, CrearOrdenForjaRequest, DaemonConfig, DelegarConsejoRequest,
-    DpoConsolidarResponse, EventoDaemon, ForgeOrdenesResponse, GatekeeperPendientesResponse,
-    GatilloTelaranaDto, HealthResponse, HuntRequest, HuntResponse, NodoTelaranaDto, OptOutRequest,
-    OptOutResponse, OrdenPendienteDto, PulseEstadoResponse, RechazarOrdenRequest,
-    RegistroOrdenForjaDto, ResumenIslaDto, TelaranaResponse,
+    BrollEstadoResponse, CouncilCuotasResponse, CrearOrdenForjaRequest, DaemonConfig,
+    DelegarConsejoRequest, DpoConsolidarResponse, EventoDaemon, ForgeOrdenesResponse,
+    GatekeeperPendientesResponse, GatilloTelaranaDto, GenerarBriefsHiggsfieldRequest,
+    GenerarBriefsHiggsfieldResponse, HealthResponse, HuntRequest, HuntResponse, NodoTelaranaDto,
+    OptOutRequest, OptOutResponse, OrdenPendienteDto, PulseEstadoResponse, RechazarOrdenRequest,
+    RegistrarClipBrollRequest, RegistroOrdenForjaDto, ResumenIslaDto, TelaranaResponse,
 };

@@ -1,16 +1,19 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use aurora_domain::{validar_activo, ActivoGenerado, TipoActivoGenerado};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
+use crate::broll::BibliotecaBroll;
 use crate::document::{
-    generar_html_dossier, generar_html_escena, DocumentEngine,
+    generar_html_dossier, generar_html_escena, generar_html_overlay_transparente, DocumentEngine,
 };
 use crate::error::{FactoryError, FactoryResult};
 use crate::manifest::{
-    construir_metadatos_artefacto, PaqueteManufacturado, SolicitudManufactura,
+    construir_metadatos_artefacto, ModoComposicionVideo, PaqueteManufacturado, SolicitudManufactura,
 };
 use crate::tts::TtsEngine;
 use crate::video::{generar_subtitulos_srt, VideoComposer};
@@ -44,6 +47,7 @@ where
     tts: T,
     document: D,
     video: V,
+    broll: Option<Arc<Mutex<BibliotecaBroll>>>,
 }
 
 impl<T, D, V> FabricaMultimodalAurora<T, D, V>
@@ -60,7 +64,16 @@ where
             tts,
             document,
             video,
+            broll: None,
         }
+    }
+
+    /// Conecta la biblioteca B-Roll persistente en NVMe para habilitar composición cinematográfica
+    /// con degradación automática a diapositivas PNG cuando falten clips para la vertical.
+    #[must_use]
+    pub fn con_biblioteca_broll(mut self, biblioteca: Arc<Mutex<BibliotecaBroll>>) -> Self {
+        self.broll = Some(biblioteca);
+        self
     }
 
     /// Devuelve referencia a la configuración de salida.
@@ -129,17 +142,66 @@ where
 
         let html_dossier =
             generar_html_dossier(&solicitud.prospecto, &solicitud.diagnostico, &solicitud.brief);
-        let html_escenas: Vec<String> = solicitud
-            .brief
-            .escenas_reel
+
+        // 1b. Consultar BibliotecaBroll si está conectada (rotación justa por usos_acumulados).
+        let clips_seleccionados = if let Some(ref broll_lock) = self.broll {
+            let mut bib = broll_lock.lock().await;
+            bib.seleccionar_clips_para_reel(
+                &solicitud.diagnostico.vertical_optima,
+                solicitud.prospecto.perfil_psicologico,
+                solicitud.brief.escenas_reel.len().max(1),
+            )
+        } else {
+            Vec::new()
+        };
+
+        let usar_broll = !clips_seleccionados.is_empty();
+        let modo_video = if usar_broll {
+            ModoComposicionVideo::CinematograficoBroll
+        } else {
+            ModoComposicionVideo::DiapositivasEstaticas
+        };
+        let clips_broll_usados: Vec<uuid::Uuid> =
+            clips_seleccionados.iter().map(|c| c.id).collect();
+        let rutas_clips_broll: Vec<PathBuf> = clips_seleccionados
             .iter()
-            .enumerate()
-            .map(|(idx, escena)| {
-                generar_html_escena(escena, &solicitud.brief, &solicitud.diagnostico, idx == 0)
-            })
+            .map(|c| c.ruta_nvme.clone())
             .collect();
 
-        // 2. Rama concurrente CPU/RAM: síntesis de voz + maquetado HTML -> PDF & PNG
+        let total_escenas = solicitud.brief.escenas_reel.len();
+        let html_visuales: Vec<String> = if usar_broll {
+            solicitud
+                .brief
+                .escenas_reel
+                .iter()
+                .enumerate()
+                .map(|(idx, escena)| {
+                    generar_html_overlay_transparente(
+                        escena,
+                        idx,
+                        total_escenas,
+                        &solicitud.diagnostico.vertical_optima,
+                    )
+                })
+                .collect()
+        } else {
+            solicitud
+                .brief
+                .escenas_reel
+                .iter()
+                .enumerate()
+                .map(|(idx, escena)| {
+                    generar_html_escena(
+                        escena,
+                        &solicitud.brief,
+                        &solicitud.diagnostico,
+                        idx == 0,
+                    )
+                })
+                .collect()
+        };
+
+        // 2. Rama concurrente CPU/RAM: síntesis de voz + maquetado HTML -> PDF & PNG/Overlays
         let fut_tts = self.tts.sintetizar_voz(
             &solicitud.brief.guion_tts,
             solicitud.prospecto.perfil_psicologico,
@@ -147,14 +209,20 @@ where
         );
         let fut_docs = async {
             let tiempo_pdf = self.document.renderizar_pdf(&html_dossier, &ruta_pdf).await?;
-            let frames = self
-                .document
-                .renderizar_frames_png(&html_escenas, dir_frames)
-                .await?;
-            Ok::<_, FactoryError>((tiempo_pdf, frames))
+            let visuales = if usar_broll {
+                let dir_overlays = dir_orden.join("overlays");
+                self.document
+                    .renderizar_overlays_transparentes(&html_visuales, &dir_overlays)
+                    .await?
+            } else {
+                self.document
+                    .renderizar_frames_png(&html_visuales, dir_frames)
+                    .await?
+            };
+            Ok::<_, FactoryError>((tiempo_pdf, visuales))
         };
 
-        let (audio_res, (tiempo_pdf_ms, frames)) = tokio::try_join!(fut_tts, fut_docs)?;
+        let (audio_res, (tiempo_pdf_ms, visuales)) = tokio::try_join!(fut_tts, fut_docs)?;
 
         // 3. Generación determinista de subtítulos SRT alineados al WAV generado
         let inicio_srt = std::time::Instant::now();
@@ -173,11 +241,22 @@ where
             })?;
         let tiempo_srt_ms = inicio_srt.elapsed().as_millis() as u64;
 
-        // 4. Ensamblaje de Reel vertical MP4 (NVENC prioritario o fallback CPU libx264)
-        let video_res = self
-            .video
-            .ensamblar_reel_vertical(&frames, &ruta_wav, &ruta_srt, &ruta_mp4)
-            .await?;
+        // 4. Ensamblaje de Reel vertical MP4 (cinematográfico B-Roll o respaldo diapositivas PNG)
+        let video_res = if usar_broll {
+            self.video
+                .ensamblar_reel_con_broll(
+                    &rutas_clips_broll,
+                    &visuales,
+                    &ruta_wav,
+                    &ruta_srt,
+                    &ruta_mp4,
+                )
+                .await?
+        } else {
+            self.video
+                .ensamblar_reel_vertical(&visuales, &ruta_wav, &ruta_srt, &ruta_mp4)
+                .await?
+        };
 
         // 5. Cálculo de metadatos y sellado SHA-256 en NVMe
         let dossier_pdf = construir_metadatos_artefacto(&ruta_pdf, None, tiempo_pdf_ms).await?;
@@ -224,6 +303,8 @@ where
         info!(
             orden_id = %solicitud.orden.orden_id,
             codec_video = video_res.codec_usado.as_str(),
+            modo_video = ?modo_video,
+            clips_broll = clips_broll_usados.len(),
             pdf_bytes = dossier_pdf.tamano_bytes,
             wav_ms = audio_res.duracion_ms,
             "PaqueteManufacturado sellado correctamente en NVMe"
@@ -240,6 +321,8 @@ where
             subtitulos_srt,
             mensaje_directo_texto,
             activos_actualizados,
+            modo_video,
+            clips_broll_usados,
             generado_en: ahora,
         })
     }

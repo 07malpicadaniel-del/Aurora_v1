@@ -187,6 +187,53 @@ impl DocumentEngine for HybridDocumentEngine {
             }
         }
     }
+
+    async fn renderizar_overlays_transparentes(
+        &self,
+        html_overlays: &[String],
+        directorio_overlays: &Path,
+    ) -> FactoryResult<Vec<PathBuf>> {
+        match self.modo {
+            ModoEjecucion::SimuladoOffline => {
+                self.fallback
+                    .renderizar_overlays_transparentes(html_overlays, directorio_overlays)
+                    .await
+            }
+            ModoEjecucion::EstrictoReal => {
+                self.real
+                    .renderizar_overlays_transparentes(html_overlays, directorio_overlays)
+                    .await
+            }
+            ModoEjecucion::RealConFallback => {
+                if !self.binario_disponible {
+                    warn!(
+                        bin = %self.real.config().binario_navegador.display(),
+                        "Navegador headless no disponible; usando overlays PNG RGBA de respaldo"
+                    );
+                    return self
+                        .fallback
+                        .renderizar_overlays_transparentes(html_overlays, directorio_overlays)
+                        .await;
+                }
+                match self
+                    .real
+                    .renderizar_overlays_transparentes(html_overlays, directorio_overlays)
+                    .await
+                {
+                    Ok(overlays) => Ok(overlays),
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "Error capturando overlays PNG transparentes en Chromium; cayendo a respaldo"
+                        );
+                        self.fallback
+                            .renderizar_overlays_transparentes(html_overlays, directorio_overlays)
+                            .await
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Adaptador híbrido para FFmpeg NVENC/CPU (`FfmpegNvencComposer` -> `DeterministicMockVideoComposer`).
@@ -241,6 +288,71 @@ impl VideoComposer for HybridVideoComposer {
                         warn!(error = %err, "Fallo FFmpeg ensamblando Reel; cayendo a respaldo");
                         self.fallback
                             .ensamblar_reel_vertical(frames, audio_wav, srt, salida_mp4)
+                            .await
+                    }
+                }
+            }
+        }
+    }
+
+    async fn ensamblar_reel_con_broll(
+        &self,
+        clips_broll: &[PathBuf],
+        overlays_png: &[PathBuf],
+        audio_wav: &Path,
+        srt: &Path,
+        salida_mp4: &Path,
+    ) -> FactoryResult<ResultadoVideo> {
+        match self.modo {
+            ModoEjecucion::SimuladoOffline => {
+                self.fallback
+                    .ensamblar_reel_con_broll(clips_broll, overlays_png, audio_wav, srt, salida_mp4)
+                    .await
+            }
+            ModoEjecucion::EstrictoReal => {
+                if !self.binario_disponible {
+                    return Err(FactoryError::VideoFfmpegFallido(format!(
+                        "binario ffmpeg '{}' requerido en modo estricto_real",
+                        self.real.config().binario_ffmpeg.display()
+                    )));
+                }
+                self.real
+                    .ensamblar_reel_con_broll(clips_broll, overlays_png, audio_wav, srt, salida_mp4)
+                    .await
+            }
+            ModoEjecucion::RealConFallback => {
+                if !self.binario_disponible {
+                    warn!("Binario ffmpeg ausente; usando compositor B-Roll de respaldo");
+                    return self
+                        .fallback
+                        .ensamblar_reel_con_broll(
+                            clips_broll,
+                            overlays_png,
+                            audio_wav,
+                            srt,
+                            salida_mp4,
+                        )
+                        .await;
+                }
+                match self
+                    .real
+                    .ensamblar_reel_con_broll(clips_broll, overlays_png, audio_wav, srt, salida_mp4)
+                    .await
+                {
+                    Ok(vid) => Ok(vid),
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "Fallo FFmpeg ensamblando Reel B-Roll; cayendo a respaldo"
+                        );
+                        self.fallback
+                            .ensamblar_reel_con_broll(
+                                clips_broll,
+                                overlays_png,
+                                audio_wav,
+                                srt,
+                                salida_mp4,
+                            )
                             .await
                     }
                 }

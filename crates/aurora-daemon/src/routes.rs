@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aurora_council::ResultadoDelegacion;
+use aurora_factory::ClipBroll;
 use aurora_pulse::{EstadoCampanaProspecto, EventoTelemetria};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -20,11 +21,12 @@ use uuid::Uuid;
 use crate::config::ReporteSubsistemas;
 use crate::error::{DaemonError, DaemonResult};
 use crate::state::{
-    AprobarOrdenRequest, AprobarOrdenResponse, AuroraDaemonState, CouncilCuotasResponse,
-    CrearOrdenForjaRequest, DelegarConsejoRequest, DpoConsolidarResponse, ForgeOrdenesResponse,
-    GatekeeperPendientesResponse, HealthResponse, HuntRequest, HuntResponse, OptOutRequest,
+    AprobarOrdenRequest, AprobarOrdenResponse, AuroraDaemonState, BrollEstadoResponse,
+    CouncilCuotasResponse, CrearOrdenForjaRequest, DelegarConsejoRequest, DpoConsolidarResponse,
+    ForgeOrdenesResponse, GatekeeperPendientesResponse, GenerarBriefsHiggsfieldRequest,
+    GenerarBriefsHiggsfieldResponse, HealthResponse, HuntRequest, HuntResponse, OptOutRequest,
     OptOutResponse, OrdenPendienteDto, PulseEstadoResponse, RechazarOrdenRequest,
-    RegistroOrdenForjaDto, TelaranaResponse,
+    RegistrarClipBrollRequest, RegistroOrdenForjaDto, TelaranaResponse,
 };
 use aurora_memory::SubgrafoProspecto;
 
@@ -64,6 +66,15 @@ pub fn crear_router(state: Arc<AuroraDaemonState>) -> Router {
         .route(
             "/api/v1/forge/ordenes",
             get(handler_forge_ordenes_listar).post(handler_forge_ordenes_crear),
+        )
+        .route("/api/v1/factory/broll", get(handler_factory_broll_estado))
+        .route(
+            "/api/v1/factory/broll/registrar",
+            post(handler_factory_broll_registrar),
+        )
+        .route(
+            "/api/v1/factory/broll/briefs",
+            post(handler_factory_broll_briefs),
         )
         .route("/api/v1/eventos/stream", get(handler_eventos_sse))
         .route("/api/v1/ws", get(handler_eventos_ws))
@@ -200,6 +211,28 @@ async fn handler_forge_ordenes_crear(
     Json(req): Json<CrearOrdenForjaRequest>,
 ) -> DaemonResult<Json<RegistroOrdenForjaDto>> {
     let resp = state.crear_y_ejecutar_orden_forge(req).await?;
+    Ok(Json(resp))
+}
+
+async fn handler_factory_broll_estado(
+    State(state): State<Arc<AuroraDaemonState>>,
+) -> Json<BrollEstadoResponse> {
+    Json(state.obtener_estado_broll().await)
+}
+
+async fn handler_factory_broll_registrar(
+    State(state): State<Arc<AuroraDaemonState>>,
+    Json(req): Json<RegistrarClipBrollRequest>,
+) -> DaemonResult<Json<ClipBroll>> {
+    let clip = state.registrar_clip_broll(req).await?;
+    Ok(Json(clip))
+}
+
+async fn handler_factory_broll_briefs(
+    State(state): State<Arc<AuroraDaemonState>>,
+    Json(req): Json<GenerarBriefsHiggsfieldRequest>,
+) -> DaemonResult<Json<GenerarBriefsHiggsfieldResponse>> {
+    let resp = state.generar_briefs_higgsfield(req).await?;
     Ok(Json(resp))
 }
 

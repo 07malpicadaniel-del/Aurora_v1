@@ -112,6 +112,14 @@ impl Default for ConfigCouncilDaemon {
     }
 }
 
+/// Configuración de la sección `[factory]` en `aurora.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConfigFactoryDaemon {
+    /// Directorio NVMe de la biblioteca B-Roll e índice Higgsfield (`<data_dir>/assets/broll` por defecto).
+    pub broll_dir: Option<PathBuf>,
+}
+
 /// Configuración de la sección `[forge]` en `aurora.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -189,6 +197,8 @@ pub struct AuroraDaemonConfig {
     pub smtp: ConfigSmtp,
     /// Configuración del Consejo Multi-Agente (`aurora-council`) y límites de cuotas NVMe.
     pub council: ConfigCouncilDaemon,
+    /// Configuración de la fábrica multimodal y biblioteca B-Roll (`[factory]`).
+    pub factory: ConfigFactoryDaemon,
     /// Configuración del sandbox Git aislado (`aurora-forge`, Carril Ámbar).
     pub forge: ConfigForgeDaemon,
 }
@@ -221,6 +231,7 @@ impl Default for AuroraDaemonConfig {
             dpo_intervalo_minutos: 360,
             smtp: ConfigSmtp::default(),
             council: ConfigCouncilDaemon::default(),
+            factory: ConfigFactoryDaemon::default(),
             forge: ConfigForgeDaemon::default(),
         }
     }
@@ -307,6 +318,16 @@ impl AuroraDaemonConfig {
             .as_ref()
             .map(|p| expandir_tilde_path(p))
             .unwrap_or_else(|| self.data_dir_resuelto().join("artefactos"))
+    }
+
+    /// Directorio efectivo de la biblioteca B-Roll (`[factory].broll_dir` o `<data_dir>/assets/broll`).
+    #[must_use]
+    pub fn broll_dir_efectivo(&self) -> PathBuf {
+        self.factory
+            .broll_dir
+            .as_ref()
+            .map(|p| expandir_tilde_path(p))
+            .unwrap_or_else(|| self.data_dir_resuelto().join("assets/broll"))
     }
 
     /// Directorio efectivo de datasets DPO (`dpo_dir` o `<data_dir>/dpo`).
@@ -457,6 +478,9 @@ impl AuroraDaemonConfig {
         }
         if let Some(v) = leer_env("AURORA_ARTEFACTOS_DIR").filter(|s| !s.trim().is_empty()) {
             self.artefactos_dir = Some(PathBuf::from(v.trim()));
+        }
+        if let Some(v) = leer_env("AURORA_BROLL_DIR").filter(|s| !s.trim().is_empty()) {
+            self.factory.broll_dir = Some(PathBuf::from(v.trim()));
         }
         if let Some(v) = leer_env("AURORA_DPO_DIR").filter(|s| !s.trim().is_empty()) {
             self.dpo_dir = Some(PathBuf::from(v.trim()));
@@ -1277,6 +1301,9 @@ claude_max_5h = 8
 claude_max_diario = 24
 timeout_ms = 45000
 
+[factory]
+broll_dir = "~/.local/share/aurora/assets/broll"
+
 [forge]
 habilitado = true
 timeout_segundos = 180
@@ -1307,6 +1334,7 @@ timeout_segundos = 180
         assert!(cfg.forge.habilitado);
         assert_eq!(cfg.forge.timeout_segundos, 240);
         assert!(cfg.council_quota_state_efectivo().ends_with("aurora/quota_state.json"));
+        assert!(cfg.broll_dir_efectivo().ends_with("aurora/assets/broll"));
         assert!(cfg.forge_worktrees_dir_efectivo().ends_with("aurora/forge_worktrees"));
         assert!(cfg.wal_dir_efectivo().ends_with("aurora/wal"));
         assert!(cfg.artefactos_dir_efectivo().ends_with("aurora/artefactos"));

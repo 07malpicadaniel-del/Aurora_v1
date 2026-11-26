@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
+use crate::broll::validar_firma_mp4_mov;
 use crate::error::{FactoryError, FactoryResult};
 use crate::tts::leer_info_wav;
 
@@ -125,10 +126,21 @@ pub fn generar_subtitulos_srt(escenas: &[EscenaReel], duracion_total_ms: u64) ->
 /// Contrato asíncrono para ensamblaje y codificación de Reels verticales (`1080x1920`).
 #[async_trait]
 pub trait VideoComposer: Send + Sync {
-    /// Compone `frames`, `audio_wav` y `srt` en `salida_mp4`.
+    /// Compone `frames`, `audio_wav` y `srt` en `salida_mp4` (respaldo clásico de diapositivas PNG).
     async fn ensamblar_reel_vertical(
         &self,
         frames: &[PathBuf],
+        audio_wav: &Path,
+        srt: &Path,
+        salida_mp4: &Path,
+    ) -> FactoryResult<ResultadoVideo>;
+
+    /// Compone un Reel cinematográfico `1080x1920` mezclando clips B-Roll reales,
+    /// overlays PNG con canal alfa, pista de voz `audio_wav` y subtítulos `.srt`.
+    async fn ensamblar_reel_con_broll(
+        &self,
+        clips_broll: &[PathBuf],
+        overlays_png: &[PathBuf],
         audio_wav: &Path,
         srt: &Path,
         salida_mp4: &Path,
@@ -237,6 +249,143 @@ impl FfmpegNvencComposer {
         args.push("[vout]".to_string());
         args.push("-map".to_string());
         args.push(format!("{}:a", frames.len()));
+
+        match codec {
+            CodecVideoUsado::H264Nvenc => {
+                args.push("-c:v".to_string());
+                args.push("h264_nvenc".to_string());
+                args.push("-preset".to_string());
+                args.push(self.config.preset_nvenc.clone());
+                args.push("-cq".to_string());
+                args.push("23".to_string());
+            }
+            CodecVideoUsado::Libx264 | CodecVideoUsado::MockContenedor => {
+                args.push("-c:v".to_string());
+                args.push("libx264".to_string());
+                args.push("-preset".to_string());
+                args.push("medium".to_string());
+                args.push("-crf".to_string());
+                args.push("21".to_string());
+            }
+        }
+
+        args.extend([
+            "-pix_fmt".to_string(),
+            "yuv420p".to_string(),
+            "-c:a".to_string(),
+            "aac".to_string(),
+            "-b:a".to_string(),
+            "192k".to_string(),
+            "-shortest".to_string(),
+            "-movflags".to_string(),
+            "+faststart".to_string(),
+            salida_mp4.display().to_string(),
+        ]);
+
+        Ok(args)
+    }
+
+    /// Construye argumentos CLI de `ffmpeg` para composición cinematográfica:
+    /// normaliza clips B-Roll a `1080x1920` @ 30 fps (`scale` + `crop` + `setsar=1`),
+    /// ajusta duración a `audio_wav`, superpone overlays PNG transparentes por tramo temporal,
+    /// quema subtítulos `.srt` y codifica con `h264_nvenc` (o fallback `libx264`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn construir_args_ffmpeg_broll(
+        &self,
+        clips_broll: &[PathBuf],
+        overlays_png: &[PathBuf],
+        audio_wav: &Path,
+        srt: &Path,
+        duracion_total_ms: u64,
+        salida_mp4: &Path,
+        codec: CodecVideoUsado,
+    ) -> FactoryResult<Vec<String>> {
+        if clips_broll.is_empty() {
+            return Err(FactoryError::DatosInvalidos(
+                "se requiere al menos un clip B-Roll MP4/MOV para ensamblaje cinematográfico"
+                    .to_string(),
+            ));
+        }
+        if overlays_png.is_empty() {
+            return Err(FactoryError::DatosInvalidos(
+                "se requiere al menos un overlay PNG transparente para ensamblaje cinematográfico"
+                    .to_string(),
+            ));
+        }
+
+        let fps = self.config.fps.max(15);
+        let dur_total_s = (duracion_total_ms.max(1_000) as f64) / 1_000.0;
+        let dur_clip_s = (dur_total_s / (clips_broll.len() as f64)).max(0.5);
+        let dur_overlay_s = dur_total_s / (overlays_png.len() as f64);
+
+        let mut args = vec!["-y".to_string(), "-hide_banner".to_string()];
+
+        // 1. Entradas de clips maestros B-Roll con loop sin corte para cubrir la pista de voz.
+        for clip in clips_broll {
+            args.push("-stream_loop".to_string());
+            args.push("-1".to_string());
+            args.push("-t".to_string());
+            args.push(format!("{dur_clip_s:.3}"));
+            args.push("-i".to_string());
+            args.push(clip.display().to_string());
+        }
+
+        // 2. Entradas de overlays PNG RGBA transparentes.
+        for overlay in overlays_png {
+            args.push("-i".to_string());
+            args.push(overlay.display().to_string());
+        }
+
+        // 3. Pista de audio neuronal Piper WAV.
+        let audio_idx = clips_broll.len() + overlays_png.len();
+        args.push("-i".to_string());
+        args.push(audio_wav.display().to_string());
+
+        let mut filter = String::new();
+        for i in 0..clips_broll.len() {
+            let _ = write!(
+                filter,
+                "[{i}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps={fps},format=rgba[b{i}];"
+            );
+        }
+        for i in 0..clips_broll.len() {
+            let _ = write!(filter, "[b{i}]");
+        }
+        let _ = write!(
+            filter,
+            "concat=n={}:v=1:a=0,trim=duration={dur_total_s:.3},setpts=PTS-STARTPTS[vbase];",
+            clips_broll.len()
+        );
+
+        let mut etiqueta_actual = "vbase".to_string();
+        for j in 0..overlays_png.len() {
+            let input_ov = clips_broll.len() + j;
+            let t_inicio = (j as f64) * dur_overlay_s;
+            let t_fin = if j + 1 == overlays_png.len() {
+                dur_total_s + 0.05
+            } else {
+                ((j + 1) as f64) * dur_overlay_s
+            };
+            let siguiente = format!("vo{j}");
+            let _ = write!(
+                filter,
+                "[{input_ov}:v]scale=1080:1920,format=rgba[ov{j}];[{etiqueta_actual}][ov{j}]overlay=0:0:enable='between(t,{t_inicio:.3},{t_fin:.3})'[{siguiente}];"
+            );
+            etiqueta_actual = siguiente;
+        }
+
+        let srt_escapado = escapar_ruta_filtro_ffmpeg(srt);
+        let _ = write!(
+            filter,
+            "[{etiqueta_actual}]subtitles='{srt_escapado}':force_style='FontSize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=3,MarginV=120',format=yuv420p[vout]"
+        );
+
+        args.push("-filter_complex".to_string());
+        args.push(filter);
+        args.push("-map".to_string());
+        args.push("[vout]".to_string());
+        args.push("-map".to_string());
+        args.push(format!("{audio_idx}:a"));
 
         match codec {
             CodecVideoUsado::H264Nvenc => {
@@ -438,6 +587,92 @@ impl VideoComposer for FfmpegNvencComposer {
             tiempo_renderizado_ms,
         })
     }
+
+    #[tracing::instrument(skip(self, clips_broll, overlays_png), fields(clips = clips_broll.len(), overlays = overlays_png.len(), salida = %salida_mp4.display()))]
+    async fn ensamblar_reel_con_broll(
+        &self,
+        clips_broll: &[PathBuf],
+        overlays_png: &[PathBuf],
+        audio_wav: &Path,
+        srt: &Path,
+        salida_mp4: &Path,
+    ) -> FactoryResult<ResultadoVideo> {
+        validar_insumos_broll(clips_broll, overlays_png, audio_wav, srt).await?;
+        let wav_bytes =
+            tokio::fs::read(audio_wav)
+                .await
+                .map_err(|source| FactoryError::IoArtefacto {
+                    ruta: audio_wav.to_path_buf(),
+                    source,
+                })?;
+        let (_, _, duracion_ms) = leer_info_wav(&wav_bytes)?;
+
+        if let Some(parent) = salida_mp4.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|source| FactoryError::IoArtefacto {
+                    ruta: parent.to_path_buf(),
+                    source,
+                })?;
+        }
+
+        let inicio = Instant::now();
+        let codec_preferido = if self.detectar_nvenc_disponible().await {
+            CodecVideoUsado::H264Nvenc
+        } else {
+            debug!("NVENC no disponible para B-Roll; usando fallback CPU libx264");
+            CodecVideoUsado::Libx264
+        };
+
+        let args_pref = self.construir_args_ffmpeg_broll(
+            clips_broll,
+            overlays_png,
+            audio_wav,
+            srt,
+            duracion_ms,
+            salida_mp4,
+            codec_preferido,
+        )?;
+
+        let codec_final = match self.ejecutar_ffmpeg(&args_pref).await {
+            Ok(()) => codec_preferido,
+            Err(err_nvenc) if codec_preferido == CodecVideoUsado::H264Nvenc => {
+                warn!(
+                    error = %err_nvenc,
+                    "Fallo h264_nvenc componiendo B-Roll; activando fallback automático a libx264"
+                );
+                let args_cpu = self.construir_args_ffmpeg_broll(
+                    clips_broll,
+                    overlays_png,
+                    audio_wav,
+                    srt,
+                    duracion_ms,
+                    salida_mp4,
+                    CodecVideoUsado::Libx264,
+                )?;
+                self.ejecutar_ffmpeg(&args_cpu).await?;
+                CodecVideoUsado::Libx264
+            }
+            Err(err) => return Err(err),
+        };
+
+        let tiempo_renderizado_ms = inicio.elapsed().as_millis() as u64;
+        info!(
+            codec = codec_final.as_str(),
+            clips_broll = clips_broll.len(),
+            overlays = overlays_png.len(),
+            duracion_ms,
+            tiempo_renderizado_ms,
+            "Reel cinematográfico B-Roll 1080x1920 ensamblado correctamente"
+        );
+
+        Ok(ResultadoVideo {
+            ruta_mp4: salida_mp4.to_path_buf(),
+            codec_usado: codec_final,
+            duracion_ms,
+            tiempo_renderizado_ms,
+        })
+    }
 }
 
 /// Compositor determinista offline que valida keyframes/WAV/SRT y escribe un MP4 trazable.
@@ -488,6 +723,62 @@ impl VideoComposer for DeterministicMockVideoComposer {
             bytes = mp4_bytes.len(),
             duracion_ms,
             "Contenedor MP4 ISO BMFF determinista escrito en NVMe"
+        );
+
+        Ok(ResultadoVideo {
+            ruta_mp4: salida_mp4.to_path_buf(),
+            codec_usado: CodecVideoUsado::MockContenedor,
+            duracion_ms,
+            tiempo_renderizado_ms,
+        })
+    }
+
+    #[tracing::instrument(skip(self, clips_broll, overlays_png), fields(clips = clips_broll.len(), overlays = overlays_png.len(), salida = %salida_mp4.display()))]
+    async fn ensamblar_reel_con_broll(
+        &self,
+        clips_broll: &[PathBuf],
+        overlays_png: &[PathBuf],
+        audio_wav: &Path,
+        srt: &Path,
+        salida_mp4: &Path,
+    ) -> FactoryResult<ResultadoVideo> {
+        validar_insumos_broll(clips_broll, overlays_png, audio_wav, srt).await?;
+
+        let wav_bytes =
+            tokio::fs::read(audio_wav)
+                .await
+                .map_err(|source| FactoryError::IoArtefacto {
+                    ruta: audio_wav.to_path_buf(),
+                    source,
+                })?;
+        let (_, _, duracion_ms) = leer_info_wav(&wav_bytes)?;
+
+        if let Some(parent) = salida_mp4.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|source| FactoryError::IoArtefacto {
+                    ruta: parent.to_path_buf(),
+                    source,
+                })?;
+        }
+
+        let inicio = Instant::now();
+        let mp4_bytes =
+            construir_mp4_isobmff_broll(clips_broll.len(), overlays_png.len(), duracion_ms);
+        tokio::fs::write(salida_mp4, &mp4_bytes)
+            .await
+            .map_err(|source| FactoryError::IoArtefacto {
+                ruta: salida_mp4.to_path_buf(),
+                source,
+            })?;
+
+        let tiempo_renderizado_ms = inicio.elapsed().as_millis() as u64;
+        debug!(
+            bytes = mp4_bytes.len(),
+            clips = clips_broll.len(),
+            overlays = overlays_png.len(),
+            duracion_ms,
+            "Contenedor MP4 cinematográfico B-Roll determinista escrito en NVMe"
         );
 
         Ok(ResultadoVideo {
@@ -549,6 +840,32 @@ async fn validar_insumos_video(
     Ok(())
 }
 
+async fn validar_insumos_broll(
+    clips_broll: &[PathBuf],
+    overlays_png: &[PathBuf],
+    audio_wav: &Path,
+    srt: &Path,
+) -> FactoryResult<()> {
+    if clips_broll.is_empty() {
+        return Err(FactoryError::DatosInvalidos(
+            "se requiere al menos un clip B-Roll MP4/MOV para composición cinematográfica"
+                .to_string(),
+        ));
+    }
+
+    for clip in clips_broll {
+        let bytes = tokio::fs::read(clip)
+            .await
+            .map_err(|source| FactoryError::IoArtefacto {
+                ruta: clip.clone(),
+                source,
+            })?;
+        validar_firma_mp4_mov(&bytes)?;
+    }
+
+    validar_insumos_video(overlays_png, audio_wav, srt).await
+}
+
 fn escapar_ruta_filtro_ffmpeg(ruta: &Path) -> String {
     ruta.display()
         .to_string()
@@ -569,6 +886,31 @@ fn construir_mp4_isobmff_minimo(num_frames: usize, duracion_ms: u64) -> Vec<u8> 
 
     // Caja `free` trazable con metadatos internos (1080x1920, frames y duración).
     let meta = format!("AURORA_V2_REEL_1080x1920;frames={num_frames};duracion_ms={duracion_ms}");
+    let free_len = (8 + meta.len()) as u32;
+    let mut out = Vec::with_capacity(ftyp.len() + free_len as usize);
+    out.extend_from_slice(&ftyp);
+    out.extend_from_slice(&free_len.to_be_bytes());
+    out.extend_from_slice(b"free");
+    out.extend_from_slice(meta.as_bytes());
+    out
+}
+
+fn construir_mp4_isobmff_broll(
+    num_clips: usize,
+    num_overlays: usize,
+    duracion_ms: u64,
+) -> Vec<u8> {
+    let mut ftyp = Vec::new();
+    ftyp.extend_from_slice(&24_u32.to_be_bytes());
+    ftyp.extend_from_slice(b"ftyp");
+    ftyp.extend_from_slice(b"isom");
+    ftyp.extend_from_slice(&512_u32.to_be_bytes());
+    ftyp.extend_from_slice(b"isom");
+    ftyp.extend_from_slice(b"mp42");
+
+    let meta = format!(
+        "AURORA_V2_CINEMA_BROLL_1080x1920;clips={num_clips};overlays={num_overlays};duracion_ms={duracion_ms}"
+    );
     let free_len = (8 + meta.len()) as u32;
     let mut out = Vec::with_capacity(ftyp.len() + free_len as usize);
     out.extend_from_slice(&ftyp);

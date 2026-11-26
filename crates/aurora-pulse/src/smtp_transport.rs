@@ -564,6 +564,8 @@ mod tests {
                 subtitulos_srt: srt,
                 mensaje_directo_texto: "Hola Valeria, comparto análisis financiero.".to_string(),
                 activos_actualizados: vec![activo],
+                modo_video: aurora_factory::ModoComposicionVideo::DiapositivasEstaticas,
+                clips_broll_usados: Vec::new(),
                 generado_en: ahora,
             },
             url_propuesta_tracking: format!("https://aurora.local/propuesta/{prospecto_id}"),

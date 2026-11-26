@@ -5,14 +5,16 @@ use std::path::PathBuf;
 use aurora_council::{MiembroConsejo, ResultadoDelegacion, TipoTareaConsejo};
 use aurora_daemon::{
     crear_router, AprobarOrdenRequest, AprobarOrdenResponse, AuroraDaemonState,
-    CouncilCuotasResponse, CrearOrdenForjaRequest, DelegarConsejoRequest, DpoConsolidarResponse,
-    ForgeOrdenesResponse, GatekeeperPendientesResponse, HealthResponse, HuntRequest, HuntResponse,
-    OptOutRequest, OptOutResponse, OrdenPendienteDto, PulseEstadoResponse, RechazarOrdenRequest,
-    TelaranaResponse,
+    BrollEstadoResponse, CouncilCuotasResponse, CrearOrdenForjaRequest, DelegarConsejoRequest,
+    DpoConsolidarResponse, ForgeOrdenesResponse, GatekeeperPendientesResponse,
+    GenerarBriefsHiggsfieldRequest, GenerarBriefsHiggsfieldResponse, HealthResponse, HuntRequest,
+    HuntResponse, OptOutRequest, OptOutResponse, OrdenPendienteDto, PulseEstadoResponse,
+    RechazarOrdenRequest, RegistrarClipBrollRequest, TelaranaResponse,
 };
 use aurora_domain::{
-    EstadoAprobacion, SubverticalInmobiliaria, Ubicacion, VerticalComercial,
+    EstadoAprobacion, PerfilPsicologico, SubverticalInmobiliaria, Ubicacion, VerticalComercial,
 };
+use aurora_factory::{ClipBroll, EstadoBriefHiggsfield};
 use aurora_forge::TipoOrdenIngenieria;
 use aurora_memory::{IslaVertical, SubgrafoProspecto};
 use aurora_osint::{CoMencionCruda, FormatoCrudo, RegistroCrudo};
@@ -443,6 +445,117 @@ async fn endpoints_http_council_cuotas_delegar_y_forge_ordenes(
         .send()
         .await?;
     assert_eq!(forge_bloqueo.status(), StatusCode::FORBIDDEN);
+
+    server_handle.abort();
+    let _ = fs::remove_dir_all(&base_dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn endpoints_http_factory_broll_briefs_y_registro_mp4(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base_dir = dir_temporal_daemon("aurora_daemon_broll_test");
+    let (base_url, server_handle) = levantar_servidor_efimero(&base_dir).await?;
+    let client = Client::new();
+
+    // 1. Estado inicial vacío con 8 brechas de cobertura
+    let estado_ini: BrollEstadoResponse = client
+        .get(format!("{base_url}/api/v1/factory/broll"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(estado_ini.total_clips, 0);
+    assert_eq!(estado_ini.brechas_cobertura.len(), 8);
+
+    // 2. Generar briefs cinematográficos para Higgsfield
+    let vertical = VerticalComercial::Inmobiliaria(SubverticalInmobiliaria::ComercialIndustrial);
+    let briefs_resp: GenerarBriefsHiggsfieldResponse = client
+        .post(format!("{base_url}/api/v1/factory/broll/briefs"))
+        .json(&GenerarBriefsHiggsfieldRequest {
+            vertical,
+            perfil_objetivo: PerfilPsicologico::AnaliticoFinanciero,
+            cantidad: Some(2),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(briefs_resp.briefs_generados.len(), 2);
+    assert_eq!(briefs_resp.total_en_cola, 2);
+    let primer_brief_id = briefs_resp.briefs_generados[0].id;
+
+    // 3. Rechazar path traversal en registro B-Roll (400 BAD_REQUEST)
+    let resp_traversal = client
+        .post(format!("{base_url}/api/v1/factory/broll/registrar"))
+        .json(&RegistrarClipBrollRequest {
+            ruta_origen: PathBuf::from("../etc/passwd"),
+            vertical,
+            perfil_objetivo: None,
+            etiquetas: Vec::new(),
+            duracion_ms: Some(5_000),
+            ancho: Some(1080),
+            alto: Some(1920),
+            movimiento_camara: Some("dolly_in_slow".to_string()),
+            brief_id: None,
+        })
+        .send()
+        .await?;
+    assert_eq!(resp_traversal.status(), StatusCode::BAD_REQUEST);
+
+    // 4. Registrar clip MP4 válido y enlazar con el brief Higgsfield generado
+    let clip_src = base_dir.join("higgsfield_clip_demo.mp4");
+    let mut mp4 = Vec::new();
+    mp4.extend_from_slice(&24_u32.to_be_bytes());
+    mp4.extend_from_slice(b"ftyp");
+    mp4.extend_from_slice(b"isom");
+    mp4.extend_from_slice(&512_u32.to_be_bytes());
+    mp4.extend_from_slice(b"isom");
+    mp4.extend_from_slice(b"mp42");
+    fs::write(&clip_src, &mp4)?;
+
+    let clip: ClipBroll = client
+        .post(format!("{base_url}/api/v1/factory/broll/registrar"))
+        .json(&RegistrarClipBrollRequest {
+            ruta_origen: clip_src,
+            vertical,
+            perfil_objetivo: Some(PerfilPsicologico::AnaliticoFinanciero),
+            etiquetas: vec!["parque_industrial".to_string()],
+            duracion_ms: Some(5_000),
+            ancho: Some(1080),
+            alto: Some(1920),
+            movimiento_camara: Some("fpv_architectural_glide".to_string()),
+            brief_id: Some(primer_brief_id),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(clip.ruta_nvme.is_file());
+    assert_eq!(clip.sha256.len(), 64);
+
+    // 5. Confirmar inventario actualizado y brief marcado como Importado
+    let estado_post: BrollEstadoResponse = client
+        .get(format!("{base_url}/api/v1/factory/broll"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(estado_post.total_clips, 1);
+    assert_eq!(
+        estado_post
+            .clips_por_vertical
+            .get("inmobiliaria/comercial_industrial"),
+        Some(&1)
+    );
+    assert!(estado_post
+        .briefs_higgsfield
+        .iter()
+        .any(|b| b.id == primer_brief_id && b.estado == EstadoBriefHiggsfield::Importado));
 
     server_handle.abort();
     let _ = fs::remove_dir_all(&base_dir);

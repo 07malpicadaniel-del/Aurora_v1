@@ -6,6 +6,7 @@
 //! - TTS (`piper`) y maquetado HTML/PDF/PNG (`chromium --disable-gpu`) operan 100% en CPU/RAM.
 //! - `FfmpegNvencComposer` prioriza `h264_nvenc` con fallback automático a `libx264`.
 
+pub mod broll;
 pub mod document;
 pub mod error;
 pub mod manifest;
@@ -13,15 +14,21 @@ pub mod pipeline;
 pub mod tts;
 pub mod video;
 
+pub use broll::{
+    validar_firma_mp4_mov, validar_ruta_sin_traversal, BibliotecaBroll, BriefHiggsfield,
+    CatalogoBroll, ClipBroll, ColaBriefsHiggsfield, EstadoBriefHiggsfield, IndiceBroll,
+    SolicitudRegistroClipBroll, MIN_CLIPS_COBERTURA_VERTICAL, TODAS_LAS_VERTICALES,
+};
 pub use document::{
-    generar_html_dossier, generar_html_escena, sanitizar_html, ConfigHeadlessBrowser,
+    construir_png_rgba_transparente_1080x1920, generar_html_dossier, generar_html_escena,
+    generar_html_overlay_transparente, sanitizar_html, ConfigHeadlessBrowser,
     DeterministicMockDocumentEngine, DocumentEngine, HeadlessBrowserDocumentEngine,
     REEL_ALTO_PX, REEL_ANCHO_PX,
 };
 pub use error::{FactoryError, FactoryResult};
 pub use manifest::{
     construir_metadatos_artefacto, fnv1a_64_bytes, sha256_bytes, MetadatosArtefacto,
-    PaqueteManufacturado, SolicitudManufactura,
+    ModoComposicionVideo, PaqueteManufacturado, SolicitudManufactura,
 };
 pub use pipeline::{ConfigFabrica, FabricaMultimodalAurora};
 pub use tts::{

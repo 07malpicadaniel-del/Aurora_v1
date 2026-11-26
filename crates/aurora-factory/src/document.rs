@@ -258,6 +258,116 @@ pub fn generar_html_escena(
     )
 }
 
+/// Genera un overlay tipográfico vertical `1080x1920` con fondo 100% transparente
+/// (`background: transparent`) listo para superponerse sobre clips B-Roll reales en FFmpeg/NVENC.
+///
+/// Respeta estrictamente las zonas seguras verticales de Instagram Reels / TikTok / YouTube Shorts
+/// (márgenes superior >= 240 px, inferior >= 460 px, derecho >= 160 px) y aplica sanitización HTML.
+#[must_use]
+pub fn generar_html_overlay_transparente(
+    escena: &EscenaReel,
+    indice: usize,
+    total: usize,
+    vertical: &VerticalComercial,
+) -> String {
+    let overlay = sanitizar_html(&escena.texto_overlay);
+    let detalle = sanitizar_html(&escena.descripcion_visual);
+    let etiqueta_vertical = sanitizar_html(&vertical.etiqueta().replace('/', " · ").to_uppercase());
+    let total_efectivo = total.max(1);
+    let numero_escena = indice + 1;
+    let insignia = if indice == 0 {
+        "GANCHO 3S".to_string()
+    } else {
+        format!("CLAVE {numero_escena:02}/{total_efectivo:02}")
+    };
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="es-MX">
+<head>
+<meta charset="utf-8" />
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  html, body {{
+    width: {REEL_ANCHO_PX}px;
+    height: {REEL_ALTO_PX}px;
+    overflow: hidden;
+    background: transparent !important;
+    font-family: 'Inter', 'Liberation Sans', sans-serif;
+    color: #ffffff;
+  }}
+  .safe-zone {{
+    width: 100%;
+    height: 100%;
+    padding: 240px 160px 460px 72px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }}
+  .header-row {{
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 14px;
+  }}
+  .pill {{
+    display: inline-block;
+    padding: 12px 24px;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.72);
+    border: 2px solid #ffffff;
+    color: #ffffff;
+    font-size: 24px;
+    font-weight: 800;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+  }}
+  .vertical-tag {{
+    font-size: 20px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    color: rgba(255, 255, 255, 0.88);
+    text-shadow: 0 2px 12px rgba(0, 0, 0, 0.92);
+  }}
+  .headline-card {{
+    background: linear-gradient(180deg, rgba(0, 0, 0, 0.62) 0%, rgba(0, 0, 0, 0.78) 100%);
+    border-left: 8px solid #ffffff;
+    padding: 34px 36px;
+    border-radius: 12px;
+  }}
+  h1 {{
+    font-size: 74px;
+    line-height: 1.08;
+    font-weight: 900;
+    color: #ffffff;
+    text-shadow: 0 4px 22px rgba(0, 0, 0, 0.95);
+    margin-bottom: 18px;
+  }}
+  .subline {{
+    font-size: 30px;
+    line-height: 1.32;
+    font-weight: 500;
+    color: #e5e5e5;
+    text-shadow: 0 2px 14px rgba(0, 0, 0, 0.92);
+  }}
+</style>
+</head>
+<body>
+  <main class="safe-zone">
+    <header class="header-row">
+      <span class="pill">{insignia}</span>
+      <span class="vertical-tag">{etiqueta_vertical}</span>
+    </header>
+    <section class="headline-card">
+      <h1>{overlay}</h1>
+      <p class="subline">{detalle}</p>
+    </section>
+  </main>
+</body>
+</html>"#
+    )
+}
+
 /// Contrato asíncrono para renderizado HTML/CSS a PDF y keyframes PNG en CPU/RAM.
 #[async_trait]
 pub trait DocumentEngine: Send + Sync {
@@ -269,6 +379,13 @@ pub trait DocumentEngine: Send + Sync {
         &self,
         html_escenas: &[String],
         directorio_frames: &Path,
+    ) -> FactoryResult<Vec<PathBuf>>;
+
+    /// Renderiza cada overlay HTML con fondo transparente en PNG RGBA `1080x1920` dentro de `directorio_overlays`.
+    async fn renderizar_overlays_transparentes(
+        &self,
+        html_overlays: &[String],
+        directorio_overlays: &Path,
     ) -> FactoryResult<Vec<PathBuf>>;
 }
 
@@ -338,6 +455,30 @@ impl HeadlessBrowserDocumentEngine {
             "--disable-gpu".to_string(),
             "--disable-dev-shm-usage".to_string(),
             "--hide-scrollbars".to_string(),
+            format!(
+                "--window-size={},{}",
+                self.config.ancho_viewport, self.config.alto_viewport
+            ),
+            format!("--screenshot={}", salida_png.display()),
+            uri_html.to_string(),
+        ]
+    }
+
+    /// Genera argumentos CLI de captura PNG RGBA transparente (`--default-background-color=00000000`)
+    /// operando 100% en CPU/RAM (`--disable-gpu`).
+    #[must_use]
+    pub fn construir_args_screenshot_transparente(
+        &self,
+        uri_html: &str,
+        salida_png: &Path,
+    ) -> Vec<String> {
+        vec![
+            "--headless=new".to_string(),
+            "--no-sandbox".to_string(),
+            "--disable-gpu".to_string(),
+            "--disable-dev-shm-usage".to_string(),
+            "--hide-scrollbars".to_string(),
+            "--default-background-color=00000000".to_string(),
             format!(
                 "--window-size={},{}",
                 self.config.ancho_viewport, self.config.alto_viewport
@@ -492,6 +633,66 @@ impl DocumentEngine for HeadlessBrowserDocumentEngine {
         resultado?;
         Ok(salidas)
     }
+
+    #[tracing::instrument(skip(self, html_overlays), fields(overlays = html_overlays.len(), dir = %directorio_overlays.display()))]
+    async fn renderizar_overlays_transparentes(
+        &self,
+        html_overlays: &[String],
+        directorio_overlays: &Path,
+    ) -> FactoryResult<Vec<PathBuf>> {
+        if html_overlays.is_empty() {
+            return Err(FactoryError::DatosInvalidos(
+                "se requiere al menos un overlay HTML para renderizar PNG transparente".to_string(),
+            ));
+        }
+
+        tokio::fs::create_dir_all(directorio_overlays)
+            .await
+            .map_err(|source| FactoryError::IoArtefacto {
+                ruta: directorio_overlays.to_path_buf(),
+                source,
+            })?;
+
+        let dir_tmp = std::env::temp_dir().join(format!("aurora_overlays_{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir_tmp)
+            .await
+            .map_err(|source| FactoryError::IoArtefacto {
+                ruta: dir_tmp.clone(),
+                source,
+            })?;
+
+        let mut salidas = Vec::with_capacity(html_overlays.len());
+        let resultado: FactoryResult<()> = async {
+            for (idx, html) in html_overlays.iter().enumerate() {
+                if html.trim().is_empty() {
+                    return Err(FactoryError::DatosInvalidos(format!(
+                        "el overlay HTML #{} está vacío",
+                        idx + 1
+                    )));
+                }
+                let ruta_html = dir_tmp.join(format!("overlay_{:03}.html", idx + 1));
+                let ruta_png = directorio_overlays.join(format!("overlay_{:03}.png", idx + 1));
+
+                tokio::fs::write(&ruta_html, html.as_bytes())
+                    .await
+                    .map_err(|source| FactoryError::IoArtefacto {
+                        ruta: ruta_html.clone(),
+                        source,
+                    })?;
+
+                let uri = format!("file://{}", ruta_html.display());
+                let args = self.construir_args_screenshot_transparente(&uri, &ruta_png);
+                self.ejecutar_chromium(&args).await?;
+                salidas.push(ruta_png);
+            }
+            Ok(())
+        }
+        .await;
+
+        let _ = tokio::fs::remove_dir_all(&dir_tmp).await;
+        resultado?;
+        Ok(salidas)
+    }
 }
 
 /// Motor determinista offline para pruebas CI/CD sin Chromium instalado.
@@ -574,6 +775,47 @@ impl DocumentEngine for DeterministicMockDocumentEngine {
 
         Ok(rutas)
     }
+
+    #[tracing::instrument(skip(self, html_overlays), fields(overlays = html_overlays.len(), dir = %directorio_overlays.display()))]
+    async fn renderizar_overlays_transparentes(
+        &self,
+        html_overlays: &[String],
+        directorio_overlays: &Path,
+    ) -> FactoryResult<Vec<PathBuf>> {
+        if html_overlays.is_empty() {
+            return Err(FactoryError::DatosInvalidos(
+                "se requiere al menos un overlay HTML transparente".to_string(),
+            ));
+        }
+
+        tokio::fs::create_dir_all(directorio_overlays)
+            .await
+            .map_err(|source| FactoryError::IoArtefacto {
+                ruta: directorio_overlays.to_path_buf(),
+                source,
+            })?;
+
+        let png_rgba_bytes = construir_png_rgba_transparente_1080x1920();
+        let mut rutas = Vec::with_capacity(html_overlays.len());
+        for (idx, html) in html_overlays.iter().enumerate() {
+            if html.trim().is_empty() {
+                return Err(FactoryError::DatosInvalidos(format!(
+                    "overlay HTML #{} vacío",
+                    idx + 1
+                )));
+            }
+            let ruta = directorio_overlays.join(format!("overlay_{:03}.png", idx + 1));
+            tokio::fs::write(&ruta, &png_rgba_bytes)
+                .await
+                .map_err(|source| FactoryError::IoArtefacto {
+                    ruta: ruta.clone(),
+                    source,
+                })?;
+            rutas.push(ruta);
+        }
+
+        Ok(rutas)
+    }
 }
 
 fn construir_pdf_minimo_valido(html_len: usize) -> Vec<u8> {
@@ -632,6 +874,87 @@ fn construir_png_minimo_1080x1920() -> Vec<u8> {
     // Chunk IEND de cierre.
     escribir_chunk_png(&mut out, *b"IEND", &[]);
     out
+}
+
+/// Construye un archivo PNG RGBA (`color_type = 6`, 8-bit) de `1080x1920` completamente transparente
+/// con flujo zlib/DEFLATE RFC 1951 válido y decodificable por `ffmpeg` y cualquier visor PNG.
+#[must_use]
+pub fn construir_png_rgba_transparente_1080x1920() -> Vec<u8> {
+    let mut out = Vec::with_capacity(60_000);
+    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+
+    // Chunk IHDR: 1080 x 1920, 8-bit RGBA (color_type = 6).
+    let mut ihdr = [0_u8; 13];
+    ihdr[0..4].copy_from_slice(&REEL_ANCHO_PX.to_be_bytes());
+    ihdr[4..8].copy_from_slice(&REEL_ALTO_PX.to_be_bytes());
+    ihdr[8] = 8; // bit depth
+    ihdr[9] = 6; // color type RGBA (con canal alfa)
+    ihdr[10] = 0; // compression deflate
+    ihdr[11] = 0; // filter adaptive
+    ihdr[12] = 0; // no interlace
+    escribir_chunk_png(&mut out, *b"IHDR", &ihdr);
+
+    // Cada fila de escaneo tiene 1 byte de filtro (0x00) + 1080 * 4 bytes RGBA (0x00 = transparente).
+    let total_bytes = (REEL_ALTO_PX as usize) * (1 + (REEL_ANCHO_PX as usize) * 4);
+    let idat = comprimir_zlib_ceros_rfc1951(total_bytes);
+    escribir_chunk_png(&mut out, *b"IDAT", &idat);
+    escribir_chunk_png(&mut out, *b"IEND", &[]);
+    out
+}
+
+fn comprimir_zlib_ceros_rfc1951(total_ceros: usize) -> Vec<u8> {
+    let mut zlib = Vec::with_capacity((total_ceros / 258) * 2 + 64);
+    // Cabecera Zlib RFC 1950: CMF=0x78 (DEFLATE 32K), FLG=0x01 (FCHECK válido).
+    zlib.push(0x78);
+    zlib.push(0x01);
+
+    let mut bit_buf: u64 = 0;
+    let mut bit_count: u32 = 0;
+    let mut push_bits = |val: u64, nbits: u32, dst: &mut Vec<u8>| {
+        bit_buf |= val << bit_count;
+        bit_count += nbits;
+        while bit_count >= 8 {
+            dst.push((bit_buf & 0xff) as u8);
+            bit_buf >>= 8;
+            bit_count -= 8;
+        }
+    };
+
+    // Bloque final (BFINAL=1) con Huffman fijo (BTYPE=01 -> bits LSB-first: 1, 1, 0).
+    push_bits(0b011, 3, &mut zlib);
+
+    // Literal 0x00 en Huffman fijo = 0b0011_0000 MSB-first -> 0b0000_1100 LSB-first (8 bits).
+    const LIT_ZERO_LSB: u64 = 0b0000_1100;
+    // Código 285 (longitud 258, 0 bits extra) = 0b1100_0101 MSB-first -> 0b1010_0011 LSB-first (8 bits).
+    const LEN_258_LSB: u64 = 0b1010_0011;
+    // Distancia 1 (código 0, 0 bits extra) = 5 bits cero.
+    const DIST_1_LSB: u64 = 0;
+
+    if total_ceros > 0 {
+        push_bits(LIT_ZERO_LSB, 8, &mut zlib);
+        let mut restantes = total_ceros - 1;
+        while restantes >= 258 {
+            push_bits(LEN_258_LSB, 8, &mut zlib);
+            push_bits(DIST_1_LSB, 5, &mut zlib);
+            restantes -= 258;
+        }
+        for _ in 0..restantes {
+            push_bits(LIT_ZERO_LSB, 8, &mut zlib);
+        }
+    }
+
+    // Fin de bloque (código 256 = 7 bits cero en Huffman fijo).
+    push_bits(0, 7, &mut zlib);
+    if bit_count > 0 {
+        zlib.push((bit_buf & 0xff) as u8);
+    }
+
+    // Adler-32 de `total_ceros` bytes cero: s1 = 1, s2 = total_ceros % 65521.
+    let s1: u32 = 1;
+    let s2: u32 = (total_ceros % 65_521) as u32;
+    let adler32: u32 = (s2 << 16) | s1;
+    zlib.extend_from_slice(&adler32.to_be_bytes());
+    zlib
 }
 
 fn escribir_chunk_png(dst: &mut Vec<u8>, tipo: [u8; 4], payload: &[u8]) {

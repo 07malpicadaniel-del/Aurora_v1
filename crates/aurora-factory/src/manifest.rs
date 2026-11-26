@@ -124,6 +124,16 @@ pub struct MetadatosArtefacto {
     pub tiempo_renderizado_ms: u64,
 }
 
+/// Modalidad de composición empleada al manufacturar el Reel vertical MP4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum ModoComposicionVideo {
+    /// Respaldo clásico animando diapositivas estáticas HTML -> PNG (`zoompan`).
+    #[default]
+    DiapositivasEstaticas,
+    /// Composición cinematográfica mezclando clips maestros B-Roll + overlays PNG transparentes.
+    CinematograficoBroll,
+}
+
 /// Paquete multimodal completo listo para despacho supervisado en Fase 5 (`aurora-pulse`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaqueteManufacturado {
@@ -147,6 +157,12 @@ pub struct PaqueteManufacturado {
     pub mensaje_directo_texto: String,
     /// Activos canónicos actualizados con rutas finales en NVMe y estado `Aprobado`.
     pub activos_actualizados: Vec<ActivoGenerado>,
+    /// Modalidad de composición visual aplicada (`CinematograficoBroll` vs `DiapositivasEstaticas`).
+    #[serde(default)]
+    pub modo_video: ModoComposicionVideo,
+    /// Identificadores de los clips maestros B-Roll utilizados cuando `modo_video == CinematograficoBroll`.
+    #[serde(default)]
+    pub clips_broll_usados: Vec<Uuid>,
     /// Marca temporal UTC de cierre de manufactura.
     pub generado_en: DateTime<Utc>,
 }

@@ -127,6 +127,9 @@ impl IntoResponse for DaemonError {
             Self::Fabrica(FactoryError::ProspectoOptOut { .. }) => {
                 (StatusCode::FORBIDDEN, "LFPDPPP_OPT_OUT")
             }
+            Self::Fabrica(FactoryError::DatosInvalidos(_)) => {
+                (StatusCode::BAD_REQUEST, "FACTORY_VALIDATION")
+            }
             Self::Fabrica(_) => (StatusCode::INTERNAL_SERVER_ERROR, "FACTORY_ERROR"),
             Self::Pulso(PulseError::NoAprobadoPorGatekeeper { .. }) => {
                 (StatusCode::CONFLICT, "GATEKEEPER_LOCK")
