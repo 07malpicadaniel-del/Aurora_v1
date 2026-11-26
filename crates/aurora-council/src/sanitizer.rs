@@ -441,12 +441,17 @@ fn clasificar_alias(alias: &str) -> &'static str {
 
 fn es_telefono_mx_valido(texto: &str, start: usize, end: usize, coincidencia: &str) -> bool {
     let previo = texto[..start].chars().next_back();
-    let siguiente = texto[end..].chars().next();
+    let mut tras = texto[end..].chars();
+    let siguiente = tras.next();
+    let siguiente_segundo = tras.next();
 
     if previo.is_some_and(|c| c.is_ascii_alphanumeric() || c == '$' || c == ',') {
         return false;
     }
-    if siguiente.is_some_and(|c| c.is_ascii_alphanumeric() || c == ',') {
+    if siguiente.is_some_and(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    if siguiente == Some(',') && siguiente_segundo.is_some_and(|c| c.is_ascii_digit()) {
         return false;
     }
 

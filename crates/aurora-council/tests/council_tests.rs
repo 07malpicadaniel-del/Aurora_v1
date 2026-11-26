@@ -342,6 +342,14 @@ async fn pii_firewall_bloquea_fugas_a_nube_y_rehidrata_localmente(
     assert!(!resultado.contenido.contains("[CORREO_01]"));
     assert!(!resultado.contenido.contains("[TEL_01]"));
 
+    // Regresión UAT: teléfono MX seguido de coma en prosa (", ") también se sanitiza.
+    let (san_coma, mapa_coma) = PiiFirewall::sanitizar_texto_generico(
+        "Contacto contacto.uat@ejemplo.mx, tel +52 229 555 0199, RFC XAXX010101000 en Veracruz.",
+    );
+    assert_eq!(mapa_coma.len(), 3);
+    assert!(!san_coma.contains("229 555 0199"));
+    PiiFirewall::verificar_texto_sin_pii_generica(&san_coma)?;
+
     let _ = fs::remove_dir_all(&tmp);
     Ok(())
 }

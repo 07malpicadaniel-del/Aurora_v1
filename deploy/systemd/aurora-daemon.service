@@ -8,6 +8,7 @@ Wants=network-online.target bob-llama.service
 Type=simple
 WorkingDirectory=%h/.local/share/aurora
 ExecStart=%h/.local/bin/aurora-daemon
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
 Environment=RUST_LOG=aurora_daemon=info,aurora_pulse=info,aurora_council=info,tower_http=info
 Environment=AURORA_CONFIG_PATH=%h/.config/aurora/aurora.toml
 # Secrets opcionales sin versionar:

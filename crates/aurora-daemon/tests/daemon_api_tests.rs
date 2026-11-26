@@ -600,6 +600,30 @@ async fn portal_mobile_auth_bearer_y_publicacion_organica_http(
         .await?;
     assert_eq!(token_malo.status(), StatusCode::UNAUTHORIZED);
 
+    // 2.5 POST /api/v1/pulse/organico/publicar rechaza con 422 cualquier fuga de PII
+    let pii_resp = client
+        .post(format!("{base_url}/api/v1/pulse/organico/publicar"))
+        .bearer_auth(&token_secreto)
+        .json(&PublicarOrganicoRequest {
+            plataforma: PlataformaPulso::YouTubeShorts,
+            solicitud: SolicitudPublicacionOrganica {
+                campana_id: Uuid::new_v4(),
+                vertical: VerticalComercial::Inmobiliaria(
+                    SubverticalInmobiliaria::ComercialIndustrial,
+                ),
+                titulo: "Contacto directo: director@empresa-real.mx".to_string(),
+                descripcion: "Análisis con correo expuesto".to_string(),
+                hashtags: vec!["Monterrey".to_string()],
+                ruta_mp4: base_dir.join("reel_organico_carril_verde.mp4"),
+                sha256_mp4: "0".repeat(64),
+                programado_para: None,
+                libre_de_pii: true,
+            },
+        })
+        .send()
+        .await?;
+    assert_eq!(pii_resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
     // 3. Con Bearer válido, GET /api/v1/pulse/organico y POST /api/v1/pulse/organico/publicar funcionan
     let estado_org: PulseOrganicoResponse = client
         .get(format!("{base_url}/api/v1/pulse/organico"))

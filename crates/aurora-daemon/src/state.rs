@@ -14,7 +14,7 @@ use aurora_cortex::{
 use aurora_council::{
     BobLocalFallbackDriver, ClaudeCodeCliDriver, CodexCliDriver, DeterministicMockCouncilDriver,
     EstadoCuotaMiembro, GeminiCliDriver, MiembroConsejo, OpenCodeCliDriver, OrquestadorConsejo,
-    PeticionDelegacion, QuotaGovernor, ResultadoDelegacion, TipoTareaConsejo,
+    PeticionDelegacion, PiiFirewall, QuotaGovernor, ResultadoDelegacion, TipoTareaConsejo,
 };
 use aurora_domain::{
     validar_prospecto, EstadoAprobacion, PerfilPsicologico, Prospecto, TipoGatilloVital,
@@ -2336,6 +2336,21 @@ impl AuroraDaemonState {
         &self,
         req: PublicarOrganicoRequest,
     ) -> DaemonResult<PublicarOrganicoResponse> {
+        // Barrera LFPDPPP de Carril Verde: cero PII genérica ni nombres/aliases de prospectos activos.
+        let texto_publico = format!(
+            "{}\n{}\n{}",
+            req.solicitud.titulo,
+            req.solicitud.descripcion,
+            req.solicitud.hashtags.join(" ")
+        );
+        PiiFirewall::verificar_texto_sin_pii_generica(&texto_publico)?;
+        {
+            let mem = self.memoria.read().await;
+            for reg in mem.grafo().iter_nodos() {
+                PiiFirewall::verificar_libre_de_pii(&texto_publico, &reg.prospecto)?;
+            }
+        }
+
         let ahora = Utc::now();
         if let Some(fecha_prog) = req.solicitud.programado_para {
             if fecha_prog > ahora {

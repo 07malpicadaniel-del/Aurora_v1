@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use aurora_domain::{
     PerfilPsicologico, SubverticalInmobiliaria, SubverticalSeguros, VerticalComercial,
 };
-use aurora_memory::{MotorMemoriaAurora, SubgrafoProspecto};
+use aurora_memory::{IslaVertical, MotorMemoriaAurora, SubgrafoProspecto};
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -697,7 +697,7 @@ impl<B: BobInferenceBackend> OrquestadorComercialBob<B> {
             .backend
             .inferir_estructurado(RolCognitivo::Perfilador, &ctx_perfilador, &gramatica_diag)
             .await?;
-        let diagnostico: DiagnosticoComercial =
+        let mut diagnostico: DiagnosticoComercial =
             parsear_respuesta_estricta(&raw_diag, RolCognitivo::Perfilador)?;
         if diagnostico.prospecto_id != prospecto_id {
             return Err(CortexError::ViolacionEsquema {
@@ -708,6 +708,7 @@ impl<B: BobInferenceBackend> OrquestadorComercialBob<B> {
                 ),
             });
         }
+        reconciliar_vertical_coherente(&mut diagnostico, subgrafo.isla);
 
         let tool_diag = AuroraToolCall::EmitirDiagnosticoComercial {
             prospecto_id,
@@ -833,5 +834,49 @@ impl<B: BobInferenceBackend> OrquestadorComercialBob<B> {
             });
         }
         Ok(ajuste)
+    }
+}
+
+/// Si el LLM devolvió una `vertical_optima` de un sector que contradice explícitamente su propio
+/// `producto_gancho` y la isla comercial asignada al prospecto, reconcilia hacia la vertical de la isla.
+fn reconciliar_vertical_coherente(diagnostico: &mut DiagnosticoComercial, isla: IslaVertical) {
+    let Some(vertical_isla) = isla.a_vertical_comercial() else {
+        return;
+    };
+    if diagnostico.vertical_optima == vertical_isla {
+        return;
+    }
+
+    let gancho_lower = diagnostico.producto_gancho.to_lowercase();
+    let contradiccion_seguros = matches!(vertical_isla, VerticalComercial::Seguros(_))
+        && matches!(diagnostico.vertical_optima, VerticalComercial::Inmobiliaria(_))
+        && (gancho_lower.contains("seguro")
+            || gancho_lower.contains("hombre clave")
+            || gancho_lower.contains("hombreclave")
+            || gancho_lower.contains("gmm")
+            || gancho_lower.contains("póliza")
+            || gancho_lower.contains("poliza")
+            || gancho_lower.contains("patrimonial")
+            || gancho_lower.contains("vida")
+            || gancho_lower.contains("educativo"));
+
+    let contradiccion_inm = matches!(vertical_isla, VerticalComercial::Inmobiliaria(_))
+        && matches!(diagnostico.vertical_optima, VerticalComercial::Seguros(_))
+        && (gancho_lower.contains("inmobiliar")
+            || gancho_lower.contains("nave")
+            || gancho_lower.contains("industrial")
+            || gancho_lower.contains("preventa")
+            || gancho_lower.contains("residencial")
+            || gancho_lower.contains("parque"));
+
+    if contradiccion_seguros || contradiccion_inm {
+        warn!(
+            prospecto_id = %diagnostico.prospecto_id,
+            vertical_llm = diagnostico.vertical_optima.etiqueta(),
+            vertical_isla = vertical_isla.etiqueta(),
+            producto_gancho = %diagnostico.producto_gancho,
+            "Reconciliando vertical_optima contradictoria con producto_gancho e isla activa"
+        );
+        diagnostico.vertical_optima = vertical_isla;
     }
 }

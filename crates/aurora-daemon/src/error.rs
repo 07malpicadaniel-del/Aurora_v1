@@ -141,6 +141,11 @@ impl IntoResponse for DaemonError {
             | Self::Pulso(PulseError::CircuitBreakerAbierto { .. }) => {
                 (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMIT")
             }
+            Self::Pulso(PulseError::DespachoFallido { canal, .. })
+                if canal == "PublicacionOrganica" =>
+            {
+                (StatusCode::UNPROCESSABLE_ENTITY, "ORGANIC_VALIDATION_ERROR")
+            }
             Self::Pulso(_) => (StatusCode::INTERNAL_SERVER_ERROR, "PULSE_ERROR"),
             Self::Consejo(CouncilError::CuotaAgotada { .. })
             | Self::Consejo(CouncilError::RateLimitExterno { .. }) => {

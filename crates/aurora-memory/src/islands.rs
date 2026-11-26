@@ -65,6 +65,35 @@ impl IslaVertical {
             Self::GeneralAurora => "general_aurora",
         }
     }
+
+    /// Convierte una isla vectorial específica de vuelta a su [`VerticalComercial`] canónica.
+    /// Devuelve `None` únicamente para `GeneralAurora`.
+    #[must_use]
+    pub const fn a_vertical_comercial(&self) -> Option<VerticalComercial> {
+        match self {
+            Self::InmobiliariaPreventa => {
+                Some(VerticalComercial::Inmobiliaria(SubverticalInmobiliaria::Preventa))
+            }
+            Self::InmobiliariaResidencial => Some(VerticalComercial::Inmobiliaria(
+                SubverticalInmobiliaria::Residencial,
+            )),
+            Self::InmobiliariaComercialIndustrial => Some(VerticalComercial::Inmobiliaria(
+                SubverticalInmobiliaria::ComercialIndustrial,
+            )),
+            Self::SegurosVida => Some(VerticalComercial::Seguros(SubverticalSeguros::Vida)),
+            Self::SegurosGmm => Some(VerticalComercial::Seguros(SubverticalSeguros::Gmm)),
+            Self::SegurosHombreClave => {
+                Some(VerticalComercial::Seguros(SubverticalSeguros::HombreClave))
+            }
+            Self::SegurosEducativo => {
+                Some(VerticalComercial::Seguros(SubverticalSeguros::Educativo))
+            }
+            Self::SegurosPatrimonial => {
+                Some(VerticalComercial::Seguros(SubverticalSeguros::Patrimonial))
+            }
+            Self::GeneralAurora => None,
+        }
+    }
 }
 
 impl From<VerticalComercial> for IslaVertical {

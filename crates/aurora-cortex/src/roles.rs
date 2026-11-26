@@ -49,8 +49,10 @@ impl RolCognitivo {
                  Analiza exclusivamente el SubgrafoProspecto 4D proporcionado: capacidad adquisitiva en MXN, \
                  gatillos vitales ordenados por decaimiento temporal y vecinos del Círculo Cercano. \
                  Selecciona la VerticalComercial óptima (Inmobiliaria: Preventa/Residencial/ComercialIndustrial; \
-                 Seguros: Vida/Gmm/HombreClave/Educativo/Patrimonial), identifica el dolor principal real y formula \
-                 el ángulo de entrada respetando estrictamente la LFPDPPP. Responde ÚNICAMENTE con JSON válido bajo la gramática GBNF."
+                 Seguros: Vida/Gmm/HombreClave/Educativo/Patrimonial) manteniendo coherencia estricta entre \
+                 vertical_optima, producto_gancho y vertical_isla_json cuando aplique, identifica el dolor \
+                 principal real y formula el ángulo de entrada respetando estrictamente la LFPDPPP. \
+                 Responde ÚNICAMENTE con JSON válido bajo la gramática GBNF."
             }
             Self::DirectorCreativo => {
                 "Eres BOB en rol DIRECTOR CREATIVO de Aurora v2 para México. \
@@ -182,6 +184,11 @@ pub fn construir_contexto_perfilador(subgrafo: &SubgrafoProspecto) -> String {
     let _ = writeln!(out, "prospecto_id: {}", p.id);
     let _ = writeln!(out, "nombre_normalizado: {}", p.nombre_normalizado);
     let _ = writeln!(out, "isla_actual: {}", subgrafo.isla.nombre());
+    if let Some(vertical_isla) = subgrafo.isla.a_vertical_comercial() {
+        if let Ok(json_vertical) = serde_json::to_string(&vertical_isla) {
+            let _ = writeln!(out, "vertical_isla_json: {json_vertical}");
+        }
+    }
     let _ = writeln!(
         out,
         "ubicacion: {}, {} ({})",
