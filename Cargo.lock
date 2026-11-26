@@ -124,6 +124,7 @@ dependencies = [
  "aurora-memory",
  "aurora-osint",
  "chrono",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",

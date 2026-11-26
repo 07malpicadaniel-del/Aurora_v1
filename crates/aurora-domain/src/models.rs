@@ -295,3 +295,121 @@ pub struct ActivoGenerado {
     /// Motivo obligatorio cuando el estado es `EstadoAprobacion::Rechazado`.
     pub motivo_rechazo: Option<String>,
 }
+
+/// Nivel discreto de probabilidad de compra calculado por BOB o heurística 4D.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NivelProbabilidadCompra {
+    /// Probabilidad `>= 0.72`: alta intención y ajuste topológico inmediato.
+    Alta,
+    /// Probabilidad en `[0.45, 0.72)`: oportunidad viable en maduración.
+    Media,
+    /// Probabilidad `< 0.45`: baja urgencia o baja afinidad actual.
+    Baja,
+}
+
+impl NivelProbabilidadCompra {
+    /// Clasifica una probabilidad en `[0.0, 1.0]` bajo los umbrales canónicos de Aurora v2.
+    #[must_use]
+    pub fn desde_probabilidad(probabilidad: f32) -> Self {
+        if !probabilidad.is_finite() {
+            return Self::Baja;
+        }
+        if probabilidad >= 0.72 {
+            Self::Alta
+        } else if probabilidad >= 0.45 {
+            Self::Media
+        } else {
+            Self::Baja
+        }
+    }
+
+    /// Etiqueta estable en español para filtros HTTP, UI y observabilidad.
+    #[must_use]
+    pub const fn etiqueta(&self) -> &'static str {
+        match self {
+            Self::Alta => "Alta",
+            Self::Media => "Media",
+            Self::Baja => "Baja",
+        }
+    }
+
+    /// Interpreta el nivel desde una cadena flexible (`"alta"`, `"media"`, `"baja"`).
+    #[must_use]
+    pub fn desde_str(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "alta" => Some(Self::Alta),
+            "media" => Some(Self::Media),
+            "baja" => Some(Self::Baja),
+            _ => None,
+        }
+    }
+}
+
+/// Calificación comercial persistente emitida por BOB sobre un prospecto de la Telaraña 4D.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogacionCompraBob {
+    /// Identificador canónico del prospecto evaluado.
+    pub prospecto_id: Uuid,
+    /// Probabilidad de compra estimada en el rango `[0.0, 1.0]`.
+    pub probabilidad_compra: f32,
+    /// Clasificación discreta derivada de `probabilidad_compra`.
+    pub nivel: NivelProbabilidadCompra,
+    /// Producto o solución concreta sugerida para el primer contacto.
+    pub producto_recomendado: String,
+    /// Vertical y subvertical comercial óptima.
+    pub vertical_optima: VerticalComercial,
+    /// Explicación breve (1–2 líneas en español) para decisión rápida del operador.
+    pub justificacion_corta: String,
+    /// Peso topológico 4D combinado (gatillos vigentes + propagación de círculo cercano).
+    pub score_topologico_4d: f32,
+    /// Motor que produjo la catalogación (`"BOB GBNF"` o `"Heurística 4D"`).
+    pub evaluado_por: String,
+    /// Fecha UTC en que se emitió la calificación.
+    pub evaluado_en: DateTime<Utc>,
+}
+
+/// Objetivo estratégico dual del motor de producción audiovisual vertical (`1080x1920`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum ObjetivoContenidoVideo {
+    /// Optimizado para retención, alcance orgánico y elegibilidad de monetización
+    /// (duración objetivo >= 61 s para Creator Rewards en TikTok + CTA inbound sin PII).
+    #[default]
+    MonetizacionAlcance,
+    /// Optimizado para conversión comercial directa de un prospecto o clúster (30–55 s).
+    VentaDirectaProspecto,
+}
+
+impl ObjetivoContenidoVideo {
+    /// Duración mínima recomendada en segundos según el objetivo del video.
+    #[must_use]
+    pub const fn duracion_objetivo_min_seg(&self) -> u32 {
+        match self {
+            Self::MonetizacionAlcance => 61,
+            Self::VentaDirectaProspecto => 30,
+        }
+    }
+
+    /// Duración máxima recomendada en segundos según el objetivo del video.
+    #[must_use]
+    pub const fn duracion_objetivo_max_seg(&self) -> u32 {
+        match self {
+            Self::MonetizacionAlcance => 90,
+            Self::VentaDirectaProspecto => 55,
+        }
+    }
+
+    /// Indica si este objetivo exige contenido público 100% libre de PII (Carril Verde).
+    #[must_use]
+    pub const fn exige_cero_pii(&self) -> bool {
+        matches!(self, Self::MonetizacionAlcance)
+    }
+
+    /// Etiqueta legible para logs y UI.
+    #[must_use]
+    pub const fn etiqueta(&self) -> &'static str {
+        match self {
+            Self::MonetizacionAlcance => "monetizacion_alcance",
+            Self::VentaDirectaProspecto => "venta_directa_prospecto",
+        }
+    }
+}

@@ -7,7 +7,7 @@ use aurora_factory::ClipBroll;
 use aurora_pulse::{EstadoCampanaProspecto, EventoTelemetria};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Request, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -26,12 +26,14 @@ use crate::mobile_ui::{
 };
 use crate::state::{
     AprobarOrdenRequest, AprobarOrdenResponse, AuroraDaemonState, BrollEstadoResponse,
-    CouncilCuotasResponse, CrearOrdenForjaRequest, DelegarConsejoRequest, DpoConsolidarResponse,
+    CatalogarProspectosRequest, CatalogarProspectosResponse, CouncilCuotasResponse,
+    CrearOrdenForjaRequest, DelegarConsejoRequest, DpoConsolidarResponse, FiltroProspectosDbQuery,
     ForgeOrdenesResponse, GatekeeperPendientesResponse, GenerarBriefsHiggsfieldRequest,
-    GenerarBriefsHiggsfieldResponse, HealthResponse, HuntRequest, HuntResponse, OptOutRequest,
-    OptOutResponse, OrdenPendienteDto, PublicarOrganicoRequest, PublicarOrganicoResponse,
-    PulseEstadoResponse, PulseOrganicoResponse, RechazarOrdenRequest, RegistrarClipBrollRequest,
-    RegistroOrdenForjaDto, TelaranaResponse,
+    GenerarBriefsHiggsfieldResponse, GenerarMonetizacionRequest, GenerarMonetizacionResponse,
+    HealthResponse, HuntRequest, HuntResponse, OptOutRequest, OptOutResponse, OrdenPendienteDto,
+    ProspectosDbResponse, PublicarOrganicoRequest, PublicarOrganicoResponse, PulseEstadoResponse,
+    PulseOrganicoResponse, RechazarOrdenRequest, RegistrarClipBrollRequest, RegistroOrdenForjaDto,
+    TelaranaResponse,
 };
 use aurora_memory::SubgrafoProspecto;
 
@@ -42,6 +44,11 @@ pub fn crear_router(state: Arc<AuroraDaemonState>) -> Router {
         .route("/api/v1/health/subsistemas", get(handler_subsistemas))
         .route("/api/v1/osint/hunt", post(handler_hunt))
         .route("/api/v1/memory/telarana", get(handler_telarana))
+        .route("/api/v1/prospectos/db", get(handler_prospectos_db))
+        .route(
+            "/api/v1/prospectos/catalogar",
+            post(handler_prospectos_catalogar),
+        )
         .route(
             "/api/v1/memory/subgrafo/{prospecto_id}",
             get(handler_subgrafo),
@@ -85,6 +92,10 @@ pub fn crear_router(state: Arc<AuroraDaemonState>) -> Router {
         .route(
             "/api/v1/factory/broll/briefs",
             post(handler_factory_broll_briefs),
+        )
+        .route(
+            "/api/v1/content/generar-monetizacion",
+            post(handler_content_generar_monetizacion),
         )
         .route("/api/v1/eventos/stream", get(handler_eventos_sse))
         .route("/api/v1/ws", get(handler_eventos_ws))
@@ -278,6 +289,37 @@ async fn handler_factory_broll_briefs(
     Json(req): Json<GenerarBriefsHiggsfieldRequest>,
 ) -> DaemonResult<Json<GenerarBriefsHiggsfieldResponse>> {
     let resp = state.generar_briefs_higgsfield(req).await?;
+    Ok(Json(resp))
+}
+
+async fn handler_prospectos_db(
+    State(state): State<Arc<AuroraDaemonState>>,
+    Query(filtro): Query<FiltroProspectosDbQuery>,
+) -> DaemonResult<Json<ProspectosDbResponse>> {
+    let resp = state.obtener_prospectos_db(filtro).await?;
+    Ok(Json(resp))
+}
+
+async fn handler_prospectos_catalogar(
+    State(state): State<Arc<AuroraDaemonState>>,
+    body: Bytes,
+) -> DaemonResult<Json<CatalogarProspectosResponse>> {
+    let req = if body.iter().all(|b| b.is_ascii_whitespace()) {
+        CatalogarProspectosRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            DaemonError::SolicitudInvalida(format!("JSON inválido en prospectos/catalogar: {e}"))
+        })?
+    };
+    let resp = state.catalogar_prospectos(req).await?;
+    Ok(Json(resp))
+}
+
+async fn handler_content_generar_monetizacion(
+    State(state): State<Arc<AuroraDaemonState>>,
+    Json(req): Json<GenerarMonetizacionRequest>,
+) -> DaemonResult<Json<GenerarMonetizacionResponse>> {
+    let resp = state.generar_video_monetizacion(req).await?;
     Ok(Json(resp))
 }
 

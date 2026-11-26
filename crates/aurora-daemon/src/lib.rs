@@ -19,12 +19,14 @@ pub use scheduler::{
 };
 pub use state::{
     AprobarOrdenRequest, AprobarOrdenResponse, AristaTelaranaDto, AuroraDaemonState,
-    BrollEstadoResponse, CouncilCuotasResponse, CrearOrdenForjaRequest, DaemonConfig,
-    DelegarConsejoRequest, DpoConsolidarResponse, EventoDaemon, ForgeOrdenesResponse,
-    GatekeeperPendientesResponse, GatilloTelaranaDto, GenerarBriefsHiggsfieldRequest,
-    GenerarBriefsHiggsfieldResponse, HealthResponse, HuntRequest, HuntResponse, NodoTelaranaDto,
-    OptOutRequest, OptOutResponse, OrdenPendienteDto, PublicacionOrganicaProgramada,
-    PublicarOrganicoRequest, PublicarOrganicoResponse, PulseEstadoResponse, PulseOrganicoResponse,
-    RechazarOrdenRequest, RegistrarClipBrollRequest, RegistroOrdenForjaDto, ResumenIslaDto,
-    TelaranaResponse,
+    BrollEstadoResponse, CatalogarProspectosRequest, CatalogarProspectosResponse,
+    CouncilCuotasResponse, CrearOrdenForjaRequest, DaemonConfig, DelegarConsejoRequest,
+    DpoConsolidarResponse, EstadoComercialProspecto, EventoDaemon, FiltroProspectosDbQuery,
+    ForgeOrdenesResponse, GatekeeperPendientesResponse, GatilloTelaranaDto,
+    GenerarBriefsHiggsfieldRequest, GenerarBriefsHiggsfieldResponse, GenerarMonetizacionRequest,
+    GenerarMonetizacionResponse, HealthResponse, HuntRequest, HuntResponse, NodoTelaranaDto,
+    OptOutRequest, OptOutResponse, OrdenPendienteDto, ProspectoDbItemDto, ProspectosDbResponse,
+    PublicacionOrganicaProgramada, PublicarOrganicoRequest, PublicarOrganicoResponse,
+    PulseEstadoResponse, PulseOrganicoResponse, RechazarOrdenRequest, RegistrarClipBrollRequest,
+    RegistroOrdenForjaDto, ResumenIslaDto, ResumenProbabilidadDb, TelaranaResponse,
 };

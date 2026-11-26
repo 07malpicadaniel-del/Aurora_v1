@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use aurora_cortex::{
     AuroraToolCall, BobInferenceBackend, BriefCreativo, CalentamientoPendiente, ConfigHttpBob,
-    CortexResult, DeterministicMockBob, DiagnosticoComercial, HttpBobCortexClient,
+    CortexResult, DeterministicMockBob, DiagnosticoComercial, EscenaReel, HttpBobCortexClient,
     OrquestadorComercialBob, PlanAtaqueComercial, PlataformaCalentamiento, ResultadoEjecucionTool,
     RolCognitivo, TipoInteraccionPeriferica, ToolDispatcher,
 };
@@ -17,16 +17,20 @@ use aurora_council::{
     PeticionDelegacion, PiiFirewall, QuotaGovernor, ResultadoDelegacion, TipoTareaConsejo,
 };
 use aurora_domain::{
-    validar_prospecto, EstadoAprobacion, PerfilPsicologico, Prospecto, TipoGatilloVital,
-    TipoVinculo, Ubicacion, VerticalComercial,
+    validar_catalogacion_compra, validar_prospecto, CatalogacionCompraBob, EstadoAprobacion,
+    NivelProbabilidadCompra, ObjetivoContenidoVideo, PerfilPsicologico, Prospecto,
+    SubverticalInmobiliaria, SubverticalSeguros, TipoGatilloVital, TipoVinculo, Ubicacion,
+    VerticalComercial,
 };
 use aurora_factory::{
-    validar_ruta_sin_traversal, BibliotecaBroll, BriefHiggsfield, ClipBroll, ConfigFabrica,
-    ConfigFfmpeg, ConfigHeadlessBrowser, ConfigPiperCpu, DeterministicMockDocumentEngine,
-    DeterministicMockVideoComposer, DeterministicSilentWavEngine, DocumentEngine,
-    FabricaMultimodalAurora, FfmpegNvencComposer, HeadlessBrowserDocumentEngine,
-    PaqueteManufacturado, PiperCpuTtsEngine, ResultadoAudio, ResultadoVideo, SolicitudManufactura,
-    SolicitudRegistroClipBroll, TtsEngine, VideoComposer,
+    validar_ruta_sin_traversal, ApiHiggsfieldClient, BibliotecaBroll, BriefHiggsfield, ClipBroll,
+    ConfigFabrica, ConfigFfmpeg, ConfigHeadlessBrowser, ConfigPiperCpu,
+    DeterministicMockDocumentEngine, DeterministicMockVideoComposer, DeterministicSilentWavEngine,
+    DocumentEngine, FabricaMultimodalAurora, FfmpegNvencComposer, HeadlessBrowserDocumentEngine,
+    HiggsfieldProvider, ManualQueueHiggsfieldClient, PaqueteManufacturado,
+    PaqueteVideoMonetizacion, PiperCpuTtsEngine, ResultadoAudio, ResultadoGeneracionHiggsfield,
+    ResultadoVideo, SolicitudManufactura, SolicitudRegistroClipBroll, SolicitudVideoMonetizacion,
+    TtsEngine, VideoComposer,
 };
 use aurora_forge::{
     listar_ramas_forge, validar_rutas_permitidas, ComandoValidacion, ConfigSandboxForja,
@@ -53,7 +57,7 @@ use aurora_pulse::{
     GestorCalentamientoPeriferico, GestorPublicacionOrganica, MetaReelsGraphPublisher,
     MotorConsolidacionNocturna, OrganicSocialPublisher, PlataformaPulso, PulseResult,
     RecolectorTelemetria, RegistroInteraccion, ResumenGanchoTelemetria, SmtpEmailTransport,
-    SocialWarmupDriver, SolicitudPublicacionOrganica, TipoEventoTelemetria,
+    SocialWarmupDriver, SolicitudPublicacionOrganica, TikTokApiPublisher, TipoEventoTelemetria,
     YouTubeShortsApiPublisher,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -692,6 +696,172 @@ pub struct GenerarBriefsHiggsfieldResponse {
     pub total_en_cola: usize,
 }
 
+/// Estado comercial consolidado de un prospecto dentro de la Base de Prospectos (Telaraña 4D).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EstadoComercialProspecto {
+    /// Recién capturado en la Telaraña 4D sin orden activa aún.
+    Nuevo,
+    /// Cuenta con propuesta pendiente o aprobada en Sala Gatekeeper.
+    EnRevision,
+    /// Ya recibió al menos un despacho comercial autorizado.
+    Contactado,
+    /// Presenta señal positiva o interacción registrada en telemetría.
+    EnConversacion,
+}
+
+/// Parámetros de consulta HTTP para `GET /api/v1/prospectos/db`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FiltroProspectosDbQuery {
+    /// Filtro por nivel (`Alta`, `Media`, `Baja`, `SinEvaluar`).
+    #[serde(default)]
+    pub nivel: Option<String>,
+    /// Filtro por sector (`Inmobiliaria`, `Seguros`, `General`).
+    #[serde(default)]
+    pub sector: Option<String>,
+    /// Búsqueda de texto libre en nombre, ciudad, estado, producto o justificación.
+    #[serde(default)]
+    pub q: Option<String>,
+    /// Ordenamiento (`probabilidad_desc`, `probabilidad_asc`, `conexiones_desc`, `reciente`).
+    #[serde(default)]
+    pub orden: Option<String>,
+}
+
+/// Conteo agregado de prospectos por nivel de probabilidad de compra.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumenProbabilidadDb {
+    /// Total de prospectos activos en la Telaraña 4D.
+    pub total: usize,
+    /// Prospectos catalogados con probabilidad `Alta` (`>= 0.72`).
+    pub alta: usize,
+    /// Prospectos catalogados con probabilidad `Media` (`0.45..0.72`).
+    pub media: usize,
+    /// Prospectos catalogados con probabilidad `Baja` (`< 0.45`).
+    pub baja: usize,
+    /// Prospectos aún pendientes de evaluación por BOB.
+    pub sin_evaluar: usize,
+}
+
+/// Registro enriquecido de un prospecto para la Base de Prospectos (Telaraña 4D + Catalogación BOB).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProspectoDbItemDto {
+    /// UUID canónico del prospecto.
+    pub prospecto_id: Uuid,
+    /// Nombre normalizado del prospecto.
+    pub nombre_normalizado: String,
+    /// Ciudad y estado formateados para lectura rápida.
+    pub ubicacion: String,
+    /// Ciudad de origen.
+    pub ciudad: String,
+    /// Entidad federativa.
+    pub estado: String,
+    /// Zona comercial o corredor opcional.
+    pub zona: Option<String>,
+    /// Isla vectorial asignada.
+    pub isla: IslaVertical,
+    /// Sector macro (`Inmobiliaria`, `Seguros` o `General`).
+    pub sector: String,
+    /// Perfil psicológico detectado.
+    pub perfil_psicologico: PerfilPsicologico,
+    /// Ingreso anual estimado en MXN.
+    pub ingreso_anual_mxn: u64,
+    /// Patrimonio estimado en MXN.
+    pub patrimonio_estimado_mxn: Option<u64>,
+    /// Relevancia temporal vigente en memoria 4D.
+    pub relevancia_temporal_4d: f32,
+    /// Número total de vínculos/vecinos en el grafo de la Telaraña 4D.
+    pub conexiones_telarana: usize,
+    /// Gatillos vitales ordenados por peso vigente 4D.
+    pub gatillos_vigentes: Vec<GatilloTelaranaDto>,
+    /// Estado comercial derivado de Gatekeeper y telemetría.
+    pub estado_comercial: EstadoComercialProspecto,
+    /// Última calificación de probabilidad de compra emitida por BOB (si existe).
+    pub catalogacion: Option<CatalogacionCompraBob>,
+    /// Fuente pública trazable bajo LFPDPPP.
+    pub fuente_origen: String,
+    /// Marca temporal UTC de captura inicial.
+    pub capturado_en: DateTime<Utc>,
+}
+
+/// Respuesta de `GET /api/v1/prospectos/db`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProspectosDbResponse {
+    /// Métricas globales de la Telaraña 4D (sin recortar por filtros).
+    pub resumen: ResumenProbabilidadDb,
+    /// Cantidad de prospectos que cumplen los filtros activos.
+    pub total_filtrado: usize,
+    /// Lista filtrada y ordenada de prospectos enriquecidos.
+    pub prospectos: Vec<ProspectoDbItemDto>,
+    /// Instante UTC de generación de la vista.
+    pub generado_en: DateTime<Utc>,
+}
+
+/// Solicitud para `POST /api/v1/prospectos/catalogar`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CatalogarProspectosRequest {
+    /// Si se especifica, evalúa solo este prospecto; si es `None`, cataloga en lote la Telaraña 4D.
+    #[serde(default)]
+    pub prospecto_id: Option<Uuid>,
+    /// En modo lote, si es `true` omite prospectos que ya tienen catalogación persistida.
+    #[serde(default)]
+    pub solo_sin_evaluar: Option<bool>,
+}
+
+/// Respuesta de `POST /api/v1/prospectos/catalogar`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogarProspectosResponse {
+    /// Calificaciones creadas o actualizadas en esta ejecución.
+    pub evaluados: Vec<CatalogacionCompraBob>,
+    /// Total de prospectos evaluados.
+    pub total_evaluados: usize,
+    /// Cuántos fueron evaluados directamente con BOB GBNF en `slot_id = 0`.
+    pub evaluados_con_bob: usize,
+    /// Cuántos utilizaron respaldo determinista `"Heurística 4D"`.
+    pub evaluados_con_heuristica: usize,
+    /// Resumen actualizado de toda la base tras persistir en NVMe.
+    pub resumen: ResumenProbabilidadDb,
+}
+
+/// Solicitud para `POST /api/v1/content/generar-monetizacion`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerarMonetizacionRequest {
+    /// Vertical comercial educativa (Inmobiliaria o Seguros).
+    pub vertical: VerticalComercial,
+    /// Plataforma objetivo (`TikTok`, `Instagram` o `YouTubeShorts`).
+    pub plataforma: PlataformaPulso,
+    /// Objetivo dual del video (`MonetizacionAlcance` >= 61s por defecto).
+    #[serde(default)]
+    pub objetivo: Option<ObjetivoContenidoVideo>,
+    /// Ángulo o tema educativo opcional (debe estar libre de PII).
+    #[serde(default)]
+    pub tema_opcional: Option<String>,
+    /// Estilo narrativo objetivo (`AnaliticoFinanciero`, `DinamicoVisual` o `ConservadorPatrimonial`).
+    #[serde(default)]
+    pub perfil_objetivo: Option<PerfilPsicologico>,
+    /// Si es `true`, publica inmediatamente en Carril Verde al concluir la manufactura.
+    #[serde(default)]
+    pub publicar_ahora: Option<bool>,
+    /// Si es `true`, solicita un clip B-Roll previo vía [`HiggsfieldProvider`] (API o cola manual).
+    #[serde(default)]
+    pub usar_higgsfield_api: Option<bool>,
+}
+
+/// Respuesta de `POST /api/v1/content/generar-monetizacion`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerarMonetizacionResponse {
+    /// Video vertical `.mp4`, audio `.wav` y `.srt` sellados en NVMe.
+    pub paquete: PaqueteVideoMonetizacion,
+    /// Plataforma destino validada (`TikTok`, `Instagram` o `YouTubeShorts`).
+    pub plataforma_objetivo: PlataformaPulso,
+    /// `true` si además se despachó a la plataforma orgánica al terminar.
+    pub publicado: bool,
+    /// Comprobante de publicación orgánica cuando `publicado == true`.
+    pub comprobante_publicacion: Option<ComprobantePublicacionOrganica>,
+    /// Resultado de la integración Higgsfield (API o cola manual) si se invocó.
+    pub resultado_higgsfield: Option<ResultadoGeneracionHiggsfield>,
+    /// Confirmación explícita de superación de `PiiFirewall` (Carril Verde).
+    pub libre_de_pii_verificado: bool,
+}
+
 /// Elemento en cola de publicación orgánica programada (Carril Verde sin PII).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublicacionOrganicaProgramada {
@@ -796,6 +966,7 @@ pub struct AuroraDaemonState {
     bob_slot_lock: Arc<tokio::sync::Mutex<()>>,
     orquestador: OrquestadorComercialBob<DynBobBackend>,
     broll: Arc<tokio::sync::Mutex<BibliotecaBroll>>,
+    higgsfield: Arc<dyn HiggsfieldProvider>,
     fabrica: FabricaMultimodalAurora<DynTtsEngine, DynDocumentEngine, DynVideoComposer>,
     rate_limiter: Arc<ControladorTasaPlataforma>,
     warmup_gestor: GestorCalentamientoPeriferico<DynWarmupDriver>,
@@ -807,11 +978,13 @@ pub struct AuroraDaemonState {
     scheduler_estado: Mutex<EstadoSchedulerDpo>,
     cola_gatekeeper: Mutex<BTreeMap<Uuid, RegistroOrdenInterno>>,
     cola_organica: Mutex<Vec<PublicacionOrganicaProgramada>>,
+    catalogaciones: Mutex<HashMap<Uuid, CatalogacionCompraBob>>,
     forge_ordenes: Mutex<Vec<RegistroOrdenForjaDto>>,
     calentamientos_recientes: Mutex<Vec<RegistroInteraccion>>,
     despachos_recientes: Mutex<Vec<ComprobanteDespacho>>,
     ruta_cola_persistida: Option<PathBuf>,
     ruta_forge_persistida: Option<PathBuf>,
+    ruta_catalogacion_persistida: Option<PathBuf>,
     eventos_tx: broadcast::Sender<EventoDaemon>,
 }
 
@@ -1086,6 +1259,12 @@ impl AuroraDaemonState {
         let broll = Arc::new(tokio::sync::Mutex::new(BibliotecaBroll::abrir(
             config.broll_dir_efectivo(),
         )?));
+        let higgsfield: Arc<dyn HiggsfieldProvider> = match config.modo_efectivo() {
+            ModoEjecucion::SimuladoOffline => Arc::new(ManualQueueHiggsfieldClient),
+            ModoEjecucion::EstrictoReal | ModoEjecucion::RealConFallback => {
+                Arc::new(ApiHiggsfieldClient::new(config.config_higgsfield())?)
+            }
+        };
         let fabrica = FabricaMultimodalAurora::new(
             ConfigFabrica {
                 directorio_base: factory_dir,
@@ -1114,14 +1293,20 @@ impl AuroraDaemonState {
                 gestor_organico.registrar_publicador(Arc::new(
                     DeterministicMockSocialPublisher::new(PlataformaPulso::Instagram),
                 ));
+                gestor_organico.registrar_publicador(Arc::new(
+                    DeterministicMockSocialPublisher::new(PlataformaPulso::TikTok),
+                ));
             }
             ModoEjecucion::EstrictoReal => {
                 let yt: Arc<dyn OrganicSocialPublisher> =
                     Arc::new(YouTubeShortsApiPublisher::new(config.config_youtube_shorts())?);
                 let ig: Arc<dyn OrganicSocialPublisher> =
                     Arc::new(MetaReelsGraphPublisher::new(config.config_meta_reels())?);
+                let tt: Arc<dyn OrganicSocialPublisher> =
+                    Arc::new(TikTokApiPublisher::new(config.config_tiktok())?);
                 gestor_organico.registrar_publicador(yt);
                 gestor_organico.registrar_publicador(ig);
+                gestor_organico.registrar_publicador(tt);
             }
             ModoEjecucion::RealConFallback => {
                 let yt_real = YouTubeShortsApiPublisher::new(config.config_youtube_shorts())?;
@@ -1140,9 +1325,24 @@ impl AuroraDaemonState {
                         DeterministicMockSocialPublisher::new(PlataformaPulso::Instagram),
                     ));
                 }
+                let tt_real = TikTokApiPublisher::new(config.config_tiktok())?;
+                if tt_real.modo_real_configurado() {
+                    gestor_organico.registrar_publicador(Arc::new(tt_real));
+                } else {
+                    gestor_organico.registrar_publicador(Arc::new(
+                        DeterministicMockSocialPublisher::new(PlataformaPulso::TikTok),
+                    ));
+                }
             }
         }
         let gestor_organico = Arc::new(gestor_organico);
+
+        let ruta_catalogacion_persistida = Some(config.catalogacion_path_efectivo());
+        let catalogaciones_inicial = if let Some(ref ruta) = ruta_catalogacion_persistida {
+            cargar_catalogaciones(ruta)?
+        } else {
+            HashMap::new()
+        };
 
         let http_probe = Client::builder()
             .timeout(std::time::Duration::from_millis(500))
@@ -1180,6 +1380,7 @@ impl AuroraDaemonState {
             bob_slot_lock,
             orquestador,
             broll,
+            higgsfield,
             fabrica,
             rate_limiter,
             warmup_gestor,
@@ -1191,11 +1392,13 @@ impl AuroraDaemonState {
             scheduler_estado: Mutex::new(scheduler_inicial),
             cola_gatekeeper: Mutex::new(cola_inicial),
             cola_organica: Mutex::new(Vec::new()),
+            catalogaciones: Mutex::new(catalogaciones_inicial),
             forge_ordenes: Mutex::new(forge_inicial),
             calentamientos_recientes: Mutex::new(Vec::new()),
             despachos_recientes: Mutex::new(Vec::new()),
             ruta_cola_persistida,
             ruta_forge_persistida,
+            ruta_catalogacion_persistida,
             eventos_tx,
         }))
     }
@@ -1318,6 +1521,10 @@ impl AuroraDaemonState {
         if let Some(ref ruta) = self.ruta_forge_persistida {
             let ordenes = self.forge_ordenes.lock();
             persistir_ordenes_forge(ruta, &ordenes)?;
+        }
+        if let Some(ref ruta) = self.ruta_catalogacion_persistida {
+            let cats = self.catalogaciones.lock();
+            persistir_catalogaciones(ruta, &cats)?;
         }
         info!("WAL 4D compactado y colas persistidas en apagado ordenado");
         Ok(())
@@ -1489,6 +1696,12 @@ impl AuroraDaemonState {
             let registro = self
                 .construir_registro_orden(&mem, &subgrafo, campana_id)
                 .await?;
+            let cat_inicial = catalogacion_desde_diagnostico(
+                &registro.plan.diagnostico,
+                subgrafo.score_compuesto,
+                self.etiqueta_motor_evaluador(),
+            );
+            self.guardar_catalogacion_compra(cat_inicial)?;
             planes_encolados.push(registro);
         }
 
@@ -1531,8 +1744,16 @@ impl AuroraDaemonState {
                 return Err(DaemonError::OptOutActivo(prospecto_id));
             }
             let subgrafo = construir_subgrafo_por_uuid(&mem, prospecto_id, ahora)?;
-            self.construir_registro_orden(&mem, &subgrafo, campana_id)
-                .await?
+            let registro = self
+                .construir_registro_orden(&mem, &subgrafo, campana_id)
+                .await?;
+            let cat_actualizada = catalogacion_desde_diagnostico(
+                &registro.plan.diagnostico,
+                subgrafo.score_compuesto,
+                self.etiqueta_motor_evaluador(),
+            );
+            self.guardar_catalogacion_compra(cat_actualizada)?;
+            registro
         };
 
         let dtos = self.encolar_registros_gatekeeper(vec![registro])?;
@@ -1972,6 +2193,16 @@ impl AuroraDaemonState {
             }
         }
 
+        // Purgar también la catalogación persistida en NVMe por cumplimiento LFPDPPP.
+        {
+            let mut cats = self.catalogaciones.lock();
+            if cats.remove(&req.prospecto_id).is_some() {
+                if let Some(ref ruta) = self.ruta_catalogacion_persistida {
+                    persistir_catalogaciones(ruta, &cats)?;
+                }
+            }
+        }
+
         self.emitir_evento(
             "OptOutPurgadoLfpdppp",
             serde_json::json!({
@@ -2392,6 +2623,463 @@ impl AuroraDaemonState {
         })
     }
 
+    fn etiqueta_motor_evaluador(&self) -> &'static str {
+        match self.config.modo_efectivo() {
+            ModoEjecucion::SimuladoOffline => "BOB GBNF (Simulado)",
+            ModoEjecucion::RealConFallback | ModoEjecucion::EstrictoReal => "BOB GBNF",
+        }
+    }
+
+    fn guardar_catalogacion_compra(&self, cat: CatalogacionCompraBob) -> DaemonResult<()> {
+        validar_catalogacion_compra(&cat)?;
+        let mut cats = self.catalogaciones.lock();
+        cats.insert(cat.prospecto_id, cat);
+        if let Some(ref ruta) = self.ruta_catalogacion_persistida {
+            persistir_catalogaciones(ruta, &cats)?;
+        }
+        Ok(())
+    }
+
+    /// Devuelve la Base de Prospectos (Telaraña 4D) enriquecida con `CatalogacionCompraBob`,
+    /// conexiones topológicas, gatillos vigentes, estado comercial y métricas agregadas.
+    pub async fn obtener_prospectos_db(
+        &self,
+        filtro: FiltroProspectosDbQuery,
+    ) -> DaemonResult<ProspectosDbResponse> {
+        let mem = self.memoria.read().await;
+        let grafo = mem.grafo();
+        let ahora = Utc::now();
+
+        let catalogaciones_snap = self.catalogaciones.lock().clone();
+        let cola_snap: Vec<RegistroOrdenInterno> =
+            self.cola_gatekeeper.lock().values().cloned().collect();
+        let campanas_tel = self.telemetria.campanas_registradas();
+
+        // Conteo rápido de conexiones (aristas incidentes) por UUID de prospecto.
+        let mut conexiones_por_uuid: HashMap<Uuid, usize> = HashMap::new();
+        for rel in grafo.iter_relaciones() {
+            *conexiones_por_uuid.entry(rel.origen_id).or_insert(0) += 1;
+            *conexiones_por_uuid.entry(rel.destino_id).or_insert(0) += 1;
+        }
+
+        let mut resumen = ResumenProbabilidadDb::default();
+        let mut items = Vec::with_capacity(grafo.len_nodos());
+
+        for reg in grafo.iter_nodos() {
+            let pid = reg.prospecto.id;
+            let catalogacion = catalogaciones_snap.get(&pid).cloned();
+
+            resumen.total += 1;
+            match catalogacion.as_ref().map(|c| c.nivel) {
+                Some(NivelProbabilidadCompra::Alta) => resumen.alta += 1,
+                Some(NivelProbabilidadCompra::Media) => resumen.media += 1,
+                Some(NivelProbabilidadCompra::Baja) => resumen.baja += 1,
+                None => resumen.sin_evaluar += 1,
+            }
+
+            let relevancia_temporal_4d = grafo.relevancia_temporal_nodo(reg.node_id, ahora);
+            let mut gatillos_vigentes: Vec<GatilloTelaranaDto> = reg
+                .prospecto
+                .gatillos
+                .iter()
+                .map(|g| GatilloTelaranaDto {
+                    tipo: g.tipo,
+                    descripcion: g.descripcion.clone(),
+                    ocurrido_en: g.ocurrido_en,
+                    peso_urgencia: g.peso_urgencia,
+                    peso_vigente_4d: grafo.peso_gatillo_vigente(g, ahora),
+                })
+                .collect();
+            gatillos_vigentes.sort_by(|a, b| b.peso_vigente_4d.total_cmp(&a.peso_vigente_4d));
+
+            let estado_comercial = derivar_estado_comercial_prospecto(
+                pid,
+                &cola_snap,
+                &campanas_tel,
+                &self.telemetria,
+            );
+            let sector = sector_desde_isla(reg.isla).to_string();
+            let conexiones_telarana = conexiones_por_uuid.get(&pid).copied().unwrap_or(0);
+
+            items.push(ProspectoDbItemDto {
+                prospecto_id: pid,
+                nombre_normalizado: reg.prospecto.nombre_normalizado.clone(),
+                ubicacion: format!(
+                    "{}, {}",
+                    reg.prospecto.ubicacion.ciudad, reg.prospecto.ubicacion.estado
+                ),
+                ciudad: reg.prospecto.ubicacion.ciudad.clone(),
+                estado: reg.prospecto.ubicacion.estado.clone(),
+                zona: reg.prospecto.ubicacion.zona.clone(),
+                isla: reg.isla,
+                sector,
+                perfil_psicologico: reg.prospecto.perfil_psicologico,
+                ingreso_anual_mxn: reg.prospecto.capacidad_adquisitiva.ingreso_anual_estimado_mxn,
+                patrimonio_estimado_mxn: reg
+                    .prospecto
+                    .capacidad_adquisitiva
+                    .patrimonio_estimado_mxn,
+                relevancia_temporal_4d,
+                conexiones_telarana,
+                gatillos_vigentes,
+                estado_comercial,
+                catalogacion,
+                fuente_origen: reg.prospecto.lfpdppp.fuente_origen.clone(),
+                capturado_en: reg.prospecto.lfpdppp.capturado_en,
+            });
+        }
+
+        // Aplicar filtros opcionales (nivel, sector, búsqueda libre).
+        if let Some(nivel_raw) = filtro.nivel.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let lower = nivel_raw.to_ascii_lowercase();
+            if lower == "sin_evaluar" || lower == "sinevaluar" {
+                items.retain(|i| i.catalogacion.is_none());
+            } else if let Some(nivel_obj) = NivelProbabilidadCompra::desde_str(&lower) {
+                items.retain(|i| {
+                    i.catalogacion
+                        .as_ref()
+                        .is_some_and(|c| c.nivel == nivel_obj)
+                });
+            }
+        }
+
+        if let Some(sector_raw) = filtro
+            .sector
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let lower = sector_raw.to_ascii_lowercase();
+            if lower != "todos" && lower != "all" {
+                items.retain(|i| i.sector.to_ascii_lowercase() == lower);
+            }
+        }
+
+        if let Some(q_raw) = filtro.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let needle = q_raw.to_ascii_lowercase();
+            items.retain(|i| {
+                let prod = i
+                    .catalogacion
+                    .as_ref()
+                    .map_or("", |c| c.producto_recomendado.as_str());
+                let just = i
+                    .catalogacion
+                    .as_ref()
+                    .map_or("", |c| c.justificacion_corta.as_str());
+                i.nombre_normalizado.to_ascii_lowercase().contains(&needle)
+                    || i.ciudad.to_ascii_lowercase().contains(&needle)
+                    || i.estado.to_ascii_lowercase().contains(&needle)
+                    || i.sector.to_ascii_lowercase().contains(&needle)
+                    || prod.to_ascii_lowercase().contains(&needle)
+                    || just.to_ascii_lowercase().contains(&needle)
+            });
+        }
+
+        let orden = filtro
+            .orden
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("probabilidad_desc")
+            .to_ascii_lowercase();
+
+        match orden.as_str() {
+            "probabilidad_asc" => {
+                items.sort_by(|a, b| {
+                    let pa = a.catalogacion.as_ref().map_or(2.0_f32, |c| c.probabilidad_compra);
+                    let pb = b.catalogacion.as_ref().map_or(2.0_f32, |c| c.probabilidad_compra);
+                    pa.total_cmp(&pb)
+                        .then_with(|| a.nombre_normalizado.cmp(&b.nombre_normalizado))
+                });
+            }
+            "conexiones_desc" => {
+                items.sort_by(|a, b| {
+                    b.conexiones_telarana
+                        .cmp(&a.conexiones_telarana)
+                        .then_with(|| {
+                            let pa = a.catalogacion.as_ref().map_or(-1.0_f32, |c| c.probabilidad_compra);
+                            let pb = b.catalogacion.as_ref().map_or(-1.0_f32, |c| c.probabilidad_compra);
+                            pb.total_cmp(&pa)
+                        })
+                });
+            }
+            "reciente" => {
+                items.sort_by_key(|b| std::cmp::Reverse(b.capturado_en));
+            }
+            _ => {
+                items.sort_by(|a, b| {
+                    let pa = a.catalogacion.as_ref().map_or(-1.0_f32, |c| c.probabilidad_compra);
+                    let pb = b.catalogacion.as_ref().map_or(-1.0_f32, |c| c.probabilidad_compra);
+                    pb.total_cmp(&pa)
+                        .then_with(|| b.conexiones_telarana.cmp(&a.conexiones_telarana))
+                        .then_with(|| b.relevancia_temporal_4d.total_cmp(&a.relevancia_temporal_4d))
+                });
+            }
+        }
+
+        let total_filtrado = items.len();
+        Ok(ProspectosDbResponse {
+            resumen,
+            total_filtrado,
+            prospectos: items,
+            generado_en: ahora,
+        })
+    }
+
+    /// Cataloga uno o todos los prospectos de la Telaraña 4D mediante BOB (`RolCognitivo::Perfilador`,
+    /// bajo `bob_slot_lock`) con respaldo determinista `"Heurística 4D"` si BOB está fuera de línea.
+    #[tracing::instrument(skip(self, req))]
+    pub async fn catalogar_prospectos(
+        &self,
+        req: CatalogarProspectosRequest,
+    ) -> DaemonResult<CatalogarProspectosResponse> {
+        let solo_sin_evaluar = req.solo_sin_evaluar.unwrap_or(false);
+        let ahora = Utc::now();
+
+        let objetivos: Vec<Uuid> = if let Some(pid) = req.prospecto_id {
+            let mem = self.memoria.read().await;
+            if mem.esta_en_blacklist(pid) {
+                return Err(DaemonError::OptOutActivo(pid));
+            }
+            if mem.grafo().obtener_por_uuid(pid).is_none() {
+                return Err(DaemonError::ProspectoNoEncontrado(pid));
+            }
+            vec![pid]
+        } else {
+            let mem = self.memoria.read().await;
+            let cats = self.catalogaciones.lock();
+            mem.grafo()
+                .iter_nodos()
+                .map(|n| n.prospecto.id)
+                .filter(|id| !mem.esta_en_blacklist(*id))
+                .filter(|id| !solo_sin_evaluar || !cats.contains_key(id))
+                .collect()
+        };
+
+        let mut evaluados = Vec::with_capacity(objetivos.len());
+        let mut evaluados_con_bob = 0_usize;
+        let mut evaluados_con_heuristica = 0_usize;
+
+        for pid in objetivos {
+            let _slot_guard = self.bob_slot_lock.lock().await;
+            let mem = self.memoria.read().await;
+            if mem.esta_en_blacklist(pid) {
+                continue;
+            }
+            let subgrafo = match construir_subgrafo_por_uuid(&mem, pid, ahora) {
+                Ok(sg) => sg,
+                Err(_) => continue,
+            };
+
+            let cat = match self
+                .orquestador
+                .evaluar_probabilidad_compra(&subgrafo, &mem)
+                .await
+            {
+                Ok(diag) => {
+                    evaluados_con_bob += 1;
+                    catalogacion_desde_diagnostico(
+                        &diag,
+                        subgrafo.score_compuesto,
+                        self.etiqueta_motor_evaluador(),
+                    )
+                }
+                Err(err) => {
+                    if self.config.modo_efectivo() == ModoEjecucion::EstrictoReal {
+                        return Err(DaemonError::Cortex(err));
+                    }
+                    warn!(
+                        prospecto_id = %pid,
+                        error = %err,
+                        "BOB no disponible para catalogación; aplicando Heurística 4D"
+                    );
+                    evaluados_con_heuristica += 1;
+                    catalogacion_heuristica_4d(&subgrafo)
+                }
+            };
+            drop(mem);
+
+            self.guardar_catalogacion_compra(cat.clone())?;
+            evaluados.push(cat);
+        }
+
+        let db_actualizada = self
+            .obtener_prospectos_db(FiltroProspectosDbQuery::default())
+            .await?;
+
+        self.emitir_evento(
+            "ProspectosCatalogados",
+            serde_json::json!({
+                "total_evaluados": evaluados.len(),
+                "evaluados_con_bob": evaluados_con_bob,
+                "evaluados_con_heuristica": evaluados_con_heuristica,
+                "alta": db_actualizada.resumen.alta,
+                "media": db_actualizada.resumen.media,
+                "baja": db_actualizada.resumen.baja,
+            }),
+        );
+
+        Ok(CatalogarProspectosResponse {
+            total_evaluados: evaluados.len(),
+            evaluados,
+            evaluados_con_bob,
+            evaluados_con_heuristica,
+            resumen: db_actualizada.resumen,
+        })
+    }
+
+    /// Genera un video vertical 9:16 100% libre de PII (Carril Verde) optimizado para monetización
+    /// (`>= 61s` en TikTok Creator Rewards) o alcance comercial, usando B-Roll de Higgsfield + Piper
+    /// CPU + `h264_nvenc`, con publicación opcional hacia TikTok, Instagram Reels o YouTube Shorts.
+    #[tracing::instrument(
+        skip(self, req),
+        fields(
+            vertical = req.vertical.etiqueta(),
+            plataforma = req.plataforma.etiqueta()
+        )
+    )]
+    pub async fn generar_video_monetizacion(
+        &self,
+        req: GenerarMonetizacionRequest,
+    ) -> DaemonResult<GenerarMonetizacionResponse> {
+        if !matches!(
+            req.plataforma,
+            PlataformaPulso::TikTok
+                | PlataformaPulso::Instagram
+                | PlataformaPulso::YouTubeShorts
+        ) {
+            return Err(DaemonError::SolicitudInvalida(format!(
+                "la plataforma '{}' no soporta publicación vertical de monetización (usa TikTok, Instagram o YouTubeShorts)",
+                req.plataforma.etiqueta()
+            )));
+        }
+
+        let objetivo = req
+            .objetivo
+            .unwrap_or(ObjetivoContenidoVideo::MonetizacionAlcance);
+        let perfil = req
+            .perfil_objetivo
+            .unwrap_or(PerfilPsicologico::AnaliticoFinanciero);
+
+        // Validar tema opcional contra PiiFirewall (tanto patrones genéricos como prospectos activos).
+        if let Some(ref tema) = req.tema_opcional {
+            PiiFirewall::verificar_texto_sin_pii_generica(tema)?;
+            let mem = self.memoria.read().await;
+            for reg in mem.grafo().iter_nodos() {
+                PiiFirewall::verificar_libre_de_pii(tema, &reg.prospecto)?;
+            }
+        }
+
+        // Opcionalmente solicita/encola clip cinematográfico en Higgsfield si falta cobertura o se solicita.
+        let resultado_higgsfield = if req.usar_higgsfield_api.unwrap_or(false) {
+            let brief_candidato = {
+                let mut bib = self.broll.lock().await;
+                let existentes: Vec<BriefHiggsfield> = bib
+                    .cola_briefs()
+                    .briefs
+                    .iter()
+                    .filter(|b| b.vertical == req.vertical)
+                    .cloned()
+                    .collect();
+                if let Some(first) = existentes.into_iter().next() {
+                    first
+                } else {
+                    let nuevos = bib.generar_briefs_higgsfield(req.vertical, perfil, 1)?;
+                    nuevos.into_iter().next().ok_or_else(|| {
+                        DaemonError::Interno(
+                            "no fue posible generar brief Higgsfield para monetización".to_string(),
+                        )
+                    })?
+                }
+            };
+            let res_hf = self
+                .higgsfield
+                .solicitar_o_encolar_clip(&brief_candidato, &self.broll)
+                .await?;
+            Some(res_hf)
+        } else {
+            None
+        };
+
+        let campana_id = Uuid::new_v4();
+        let solicitud = construir_solicitud_monetizacion(
+            campana_id,
+            req.vertical,
+            objetivo,
+            perfil,
+            req.tema_opcional.as_deref(),
+        );
+
+        // Doble barrera PiiFirewall obligatoria antes de manufacturar o salir a plataformas públicas.
+        let texto_publico = format!(
+            "{}\n{}\n{}\n{}",
+            solicitud.titulo,
+            solicitud.descripcion,
+            solicitud.hashtags.join(" "),
+            solicitud.guion_tts
+        );
+        PiiFirewall::verificar_texto_sin_pii_generica(&texto_publico)?;
+        {
+            let mem = self.memoria.read().await;
+            for reg in mem.grafo().iter_nodos() {
+                PiiFirewall::verificar_libre_de_pii(&texto_publico, &reg.prospecto)?;
+            }
+        }
+
+        let paquete = self
+            .fabrica
+            .manufacturar_video_monetizacion(&solicitud)
+            .await?;
+
+        let debe_publicar = req
+            .publicar_ahora
+            .unwrap_or(self.config.scheduler.publicacion_organica_habilitada);
+
+        let comprobante_publicacion = if debe_publicar {
+            let sol_org = SolicitudPublicacionOrganica {
+                campana_id,
+                vertical: req.vertical,
+                titulo: paquete.titulo.clone(),
+                descripcion: paquete.descripcion.clone(),
+                hashtags: paquete.hashtags.clone(),
+                ruta_mp4: paquete.reel_vertical_mp4.ruta_nvme.clone(),
+                sha256_mp4: paquete.reel_vertical_mp4.sha256_hex.clone(),
+                programado_para: None,
+                libre_de_pii: true,
+                objetivo: Some(objetivo),
+            };
+            let comp = self
+                .gestor_organico
+                .publicar(req.plataforma, &sol_org, &self.telemetria)
+                .await?;
+            Some(comp)
+        } else {
+            None
+        };
+
+        let publicado = comprobante_publicacion.is_some();
+        self.emitir_evento(
+            "VideoMonetizacionGenerado",
+            serde_json::json!({
+                "campana_id": campana_id,
+                "plataforma": req.plataforma.etiqueta(),
+                "objetivo": objetivo.etiqueta(),
+                "modo_video": paquete.modo_video,
+                "duracion_estimada_seg": paquete.duracion_estimada_seg,
+                "elegible_creator_rewards_tiktok": paquete.elegible_creator_rewards_tiktok,
+                "publicado": publicado,
+            }),
+        );
+
+        Ok(GenerarMonetizacionResponse {
+            paquete,
+            plataforma_objetivo: req.plataforma,
+            publicado,
+            comprobante_publicacion,
+            resultado_higgsfield,
+            libre_de_pii_verificado: true,
+        })
+    }
+
     /// Procesa publicaciones orgánicas vencidas en la cola programada (Carril Verde AFK).
     pub async fn procesar_cola_organica_pendiente(&self) -> u64 {
         let ahora = Utc::now();
@@ -2681,4 +3369,378 @@ fn persistir_ordenes_forge(ruta: &Path, ordenes: &[RegistroOrdenForjaDto]) -> Da
         ))
     })?;
     Ok(())
+}
+
+fn cargar_catalogaciones(ruta: &Path) -> DaemonResult<HashMap<Uuid, CatalogacionCompraBob>> {
+    if !ruta.is_file() {
+        return Ok(HashMap::new());
+    }
+    let file = File::open(ruta).map_err(|e| {
+        DaemonError::Interno(format!(
+            "error abriendo archivo de catalogaciones '{}': {e}",
+            ruta.display()
+        ))
+    })?;
+    let reader = BufReader::new(file);
+    let mapa: HashMap<Uuid, CatalogacionCompraBob> =
+        serde_json::from_reader(reader).map_err(|e| {
+            DaemonError::Interno(format!(
+                "error deserializando catalogaciones '{}': {e}",
+                ruta.display()
+            ))
+        })?;
+    debug!(
+        total = mapa.len(),
+        "Catalogaciones de probabilidad de compra restauradas desde NVMe"
+    );
+    Ok(mapa)
+}
+
+fn persistir_catalogaciones(
+    ruta: &Path,
+    mapa: &HashMap<Uuid, CatalogacionCompraBob>,
+) -> DaemonResult<()> {
+    if let Some(padre) = ruta.parent() {
+        if !padre.as_os_str().is_empty() {
+            fs::create_dir_all(padre).map_err(|e| {
+                DaemonError::Interno(format!(
+                    "error creando directorio para catalogacion_compra.json '{}': {e}",
+                    padre.display()
+                ))
+            })?;
+        }
+    }
+    let json = serde_json::to_vec_pretty(mapa).map_err(|e| {
+        DaemonError::Interno(format!("error serializando catalogaciones BOB: {e}"))
+    })?;
+    let tmp = ruta.with_extension("json.tmp");
+    fs::write(&tmp, &json).map_err(|e| {
+        DaemonError::Interno(format!(
+            "error escribiendo catalogaciones temporales '{}': {e}",
+            tmp.display()
+        ))
+    })?;
+    fs::rename(&tmp, ruta).map_err(|e| {
+        DaemonError::Interno(format!(
+            "error publicando catalogaciones '{}': {e}",
+            ruta.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn sector_desde_isla(isla: IslaVertical) -> &'static str {
+    match isla {
+        IslaVertical::InmobiliariaPreventa
+        | IslaVertical::InmobiliariaResidencial
+        | IslaVertical::InmobiliariaComercialIndustrial => "Inmobiliaria",
+        IslaVertical::SegurosVida
+        | IslaVertical::SegurosGmm
+        | IslaVertical::SegurosHombreClave
+        | IslaVertical::SegurosEducativo
+        | IslaVertical::SegurosPatrimonial => "Seguros",
+        IslaVertical::GeneralAurora => "General",
+    }
+}
+
+fn derivar_estado_comercial_prospecto(
+    prospecto_id: Uuid,
+    ordenes: &[RegistroOrdenInterno],
+    campanas_ids: &[Uuid],
+    telemetria: &RecolectorTelemetria,
+) -> EstadoComercialProspecto {
+    use aurora_pulse::EstadoCampanaProspecto;
+
+    let mut contactado_por_tel = false;
+    for campana_id in campanas_ids {
+        match telemetria.estado_prospecto(*campana_id, prospecto_id) {
+            Some(EstadoCampanaProspecto::EnConversacion | EstadoCampanaProspecto::Cerrado) => {
+                return EstadoComercialProspecto::EnConversacion;
+            }
+            Some(EstadoCampanaProspecto::Enviado | EstadoCampanaProspecto::LandingVisitada) => {
+                contactado_por_tel = true;
+            }
+            _ => {}
+        }
+    }
+
+    let mut tiene_despacho = contactado_por_tel;
+    let mut tiene_revision = false;
+    for reg in ordenes {
+        if reg.plan.prospecto_id != prospecto_id {
+            continue;
+        }
+        match reg.plan.orden_produccion.estado() {
+            EstadoAprobacion::Despachado => tiene_despacho = true,
+            EstadoAprobacion::PendienteGatekeeper | EstadoAprobacion::Aprobado => {
+                tiene_revision = true;
+            }
+            EstadoAprobacion::Rechazado => {}
+        }
+    }
+    if tiene_despacho {
+        EstadoComercialProspecto::Contactado
+    } else if tiene_revision {
+        EstadoComercialProspecto::EnRevision
+    } else {
+        EstadoComercialProspecto::Nuevo
+    }
+}
+
+fn resumir_justificacion_corta(texto: &str) -> String {
+    let limpio = texto.split_whitespace().collect::<Vec<_>>().join(" ");
+    if limpio.chars().count() <= 210 {
+        return limpio;
+    }
+    let recorte: String = limpio.chars().take(207).collect();
+    format!("{}...", recorte.trim_end())
+}
+
+fn catalogacion_desde_diagnostico(
+    diag: &DiagnosticoComercial,
+    score_topologico_4d: f32,
+    evaluado_por: &str,
+) -> CatalogacionCompraBob {
+    let prob = if diag.probabilidad_cierre.is_finite() {
+        diag.probabilidad_cierre.clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let just = if diag.justificacion_topologica.trim().is_empty() {
+        diag.dolor_principal.as_str()
+    } else {
+        diag.justificacion_topologica.as_str()
+    };
+    CatalogacionCompraBob {
+        prospecto_id: diag.prospecto_id,
+        probabilidad_compra: prob,
+        nivel: NivelProbabilidadCompra::desde_probabilidad(prob),
+        producto_recomendado: diag.producto_gancho.trim().to_string(),
+        vertical_optima: diag.vertical_optima,
+        justificacion_corta: resumir_justificacion_corta(just),
+        score_topologico_4d: if score_topologico_4d.is_finite() {
+            score_topologico_4d.max(0.0)
+        } else {
+            0.0
+        },
+        evaluado_por: evaluado_por.to_string(),
+        evaluado_en: Utc::now(),
+    }
+}
+
+fn catalogacion_heuristica_4d(subgrafo: &SubgrafoProspecto) -> CatalogacionCompraBob {
+    let p = &subgrafo.prospecto;
+    let vertical_optima = subgrafo.isla.a_vertical_comercial().unwrap_or(
+        VerticalComercial::Inmobiliaria(SubverticalInmobiliaria::ComercialIndustrial),
+    );
+    let peso_ingreso =
+        ((p.capacidad_adquisitiva.ingreso_anual_estimado_mxn as f32) / 10_000_000.0).clamp(0.1, 1.0);
+    let peso_red = ((subgrafo.vecinos_circulo_cercano.len() as f32) * 0.08).clamp(0.0, 0.25);
+    let prob = (0.50 * subgrafo.score_temporal_4d.clamp(0.0, 1.0)
+        + 0.30 * peso_ingreso
+        + 0.20 * subgrafo.boost_circulo_cercano.clamp(0.0, 1.0)
+        + peso_red)
+        .clamp(0.15, 0.96);
+
+    let producto_recomendado = match vertical_optima {
+        VerticalComercial::Inmobiliaria(SubverticalInmobiliaria::Preventa) => {
+            "Inversión Inmobiliaria en Preventa".to_string()
+        }
+        VerticalComercial::Inmobiliaria(SubverticalInmobiliaria::Residencial) => {
+            "Propiedad Residencial Patrimonial".to_string()
+        }
+        VerticalComercial::Inmobiliaria(SubverticalInmobiliaria::ComercialIndustrial) => {
+            "Nave Industrial / Expansión Logística".to_string()
+        }
+        VerticalComercial::Seguros(SubverticalSeguros::Vida) => {
+            "Seguro de Vida con Protección Patrimonial".to_string()
+        }
+        VerticalComercial::Seguros(SubverticalSeguros::Gmm) => {
+            "Gastos Médicos Mayores Corporativo".to_string()
+        }
+        VerticalComercial::Seguros(SubverticalSeguros::HombreClave) => {
+            "Seguro Hombre Clave Deducible (Art. 27 LISR)".to_string()
+        }
+        VerticalComercial::Seguros(SubverticalSeguros::Educativo) => {
+            "Fideicomiso y Seguro Educativo".to_string()
+        }
+        VerticalComercial::Seguros(SubverticalSeguros::Patrimonial) => {
+            "Blindaje Patrimonial y Retiro".to_string()
+        }
+    };
+
+    let gatillo_desc = subgrafo
+        .gatillos_vigentes
+        .first()
+        .map_or("señal pública reciente en la plaza", |g| {
+            g.gatillo.descripcion.as_str()
+        });
+    let just = format!(
+        "Score 4D {:.2} con {} conexión(es) en Telaraña y señal vigente: {}.",
+        subgrafo.score_compuesto,
+        subgrafo.vecinos_circulo_cercano.len(),
+        gatillo_desc
+    );
+
+    CatalogacionCompraBob {
+        prospecto_id: p.id,
+        probabilidad_compra: prob,
+        nivel: NivelProbabilidadCompra::desde_probabilidad(prob),
+        producto_recomendado,
+        vertical_optima,
+        justificacion_corta: resumir_justificacion_corta(&just),
+        score_topologico_4d: subgrafo.score_compuesto.max(0.0),
+        evaluado_por: "Heurística 4D".to_string(),
+        evaluado_en: Utc::now(),
+    }
+}
+
+fn construir_solicitud_monetizacion(
+    campana_id: Uuid,
+    vertical: VerticalComercial,
+    objetivo: ObjetivoContenidoVideo,
+    perfil: PerfilPsicologico,
+    tema_opcional: Option<&str>,
+) -> SolicitudVideoMonetizacion {
+    let tema_limpio = tema_opcional.map(str::trim).filter(|t| !t.is_empty());
+
+    let (titulo_base, enfoque, cta, tags) = match vertical {
+        VerticalComercial::Seguros(SubverticalSeguros::HombreClave) => (
+            "Cómo deducir el Seguro Hombre Clave en México sin arriesgar la liquidez",
+            "continuidad operativa de socios directivos, deducibilidad bajo Artículo 27 fracción XI de la LISR y protección del flujo de caja empresarial",
+            "Guarda este análisis y escribe LIQUIDEZ en comentarios para recibir la guía fiscal comparativa.",
+            vec!["HombreClave", "FinanzasCorporativas", "EmpresasMX", "LISR"],
+        ),
+        VerticalComercial::Seguros(SubverticalSeguros::Gmm) => (
+            "3 errores al contratar Gastos Médicos Mayores que duplican el deducible",
+            "coaseguro topado, red hospitalaria privada en México y prevención de inflación médica anual",
+            "Guarda este video y comenta COBERTURA para recibir la tabla comparativa de deducibles.",
+            vec!["GastosMedicos", "FinanzasPersonalesMX", "SegurosMX"],
+        ),
+        VerticalComercial::Seguros(SubverticalSeguros::Vida | SubverticalSeguros::Patrimonial) => (
+            "Cómo blindar patrimonio familiar en México frente a inflación e imprevistos",
+            "fideicomisos patrimoniales, liquidez inmediata libre de juicios sucesorios y rendimiento real en UDIS o dólares",
+            "Guarda esta cápsula y escribe PATRIMONIO para revisar una proyección educativa.",
+            vec!["PatrimonioMX", "InversionSegura", "EducacionFinanciera"],
+        ),
+        VerticalComercial::Seguros(SubverticalSeguros::Educativo) => (
+            "Cuánto costará una universidad privada en México en 10 años y cómo cubrirla",
+            "interés compuesto en UDIS, protección ante fallecimiento o invalidez y ahorro educativo programado",
+            "Comenta UNIVERSIDAD para recibir el simulador educativo de ahorro a 10 y 15 años.",
+            vec!["AhorroEducativo", "FinanzasFamiliares", "Mexico"],
+        ),
+        VerticalComercial::Inmobiliaria(SubverticalInmobiliaria::ComercialIndustrial) => (
+            "Por qué las naves industriales en México lideran el retorno por nearshoring",
+            "absorción neta en corredores logísticos, contratos AAA en dólares y tasas de capitalización frente a instrumentos tradicionales",
+            "Guarda este análisis y comenta LOGISTICA para descargar el panorama de parques industriales.",
+            vec!["NearshoringMX", "BienesRaicesIndustriales", "InversionInmobiliaria"],
+        ),
+        VerticalComercial::Inmobiliaria(SubverticalInmobiliaria::Preventa) => (
+            "Cómo evaluar una preventa inmobiliaria en México sin caer en sobrecostos",
+            "plusvalía en etapa de obra, certeza jurídica de fideicomiso y cálculo real de TIR neta tras escrituración",
+            "Guarda este checklist y escribe PREVENTA para obtener los 5 filtros de inversión segura.",
+            vec!["PreventaInmobiliaria", "BienesRaicesMX", "Plusvalia"],
+        ),
+        VerticalComercial::Inmobiliaria(SubverticalInmobiliaria::Residencial) => (
+            "Qué define la plusvalía real de una residencia de alto nivel en México",
+            "ubicación consolidada, densidad controlada, liquidez de reventa y protección patrimonial a largo plazo",
+            "Comenta RESIDENCIAL para recibir el comparativo de plusvalía por corredor urbano.",
+            vec!["BienesRaicesLujo", "PatrimonioInmobiliario", "InversionMX"],
+        ),
+    };
+
+    let titulo = tema_limpio.map_or_else(
+        || titulo_base.to_string(),
+        |tema| format!("{tema} · {titulo_base}"),
+    );
+
+    let (escenas_reel, guion_tts) = match objetivo {
+        ObjetivoContenidoVideo::MonetizacionAlcance => {
+            // 5 escenas que suman 65 segundos (>= 61s para TikTok Creator Rewards).
+            let escenas = vec![
+                EscenaReel {
+                    indice: 1,
+                    duracion_segundos: 10,
+                    descripcion_visual: "Gancho cinematográfico 9:16 con dato de impacto inmediato"
+                        .to_string(),
+                    texto_overlay: titulo.chars().take(68).collect(),
+                },
+                EscenaReel {
+                    indice: 2,
+                    duracion_segundos: 14,
+                    descripcion_visual: "Contexto macroeconómico mexicano con cifras comparativas"
+                        .to_string(),
+                    texto_overlay: "El costo oculto de no planear a tiempo".to_string(),
+                },
+                EscenaReel {
+                    indice: 3,
+                    duracion_segundos: 15,
+                    descripcion_visual: "Desglose técnico en 3 pilares cuantitativos".to_string(),
+                    texto_overlay: "3 claves verificables en México".to_string(),
+                },
+                EscenaReel {
+                    indice: 4,
+                    duracion_segundos: 15,
+                    descripcion_visual: "Escenario comparativo: sin estrategia vs estructurado"
+                        .to_string(),
+                    texto_overlay: "Impacto real en flujo y patrimonio".to_string(),
+                },
+                EscenaReel {
+                    indice: 5,
+                    duracion_segundos: 11,
+                    descripcion_visual: "Cierre con llamado a la acción inbound educativo".to_string(),
+                    texto_overlay: "Guarda y solicita la guía".to_string(),
+                },
+            ];
+            let guion = format!(
+                "{titulo}. La mayoría de los inversionistas y directores en México descubre demasiado tarde cuánto dinero se pierde por no estructurar correctamente {enfoque}. \
+                 Primero, analiza el riesgo real en flujo de efectivo: una decisión reactiva suele costar entre quince y treinta por ciento más que una estrategia planeada con anticipación. \
+                 Segundo, revisa el marco fiscal y jurídico vigente en México para aprovechar deducibilidad, certeza documental y protección frente a inflación. \
+                 Tercero, compara siempre escenarios netos a tres, cinco y diez años midiendo liquidez real, no solo rendimientos nominales en papel. \
+                 Cuando ordenas estos tres pilares antes de comprometer capital, conviertes un gasto imprevisto en un activo estratégico predecible y auditable. {cta}"
+            );
+            (escenas, guion)
+        }
+        ObjetivoContenidoVideo::VentaDirectaProspecto => {
+            // 3 escenas que suman 40 segundos (rango 30–55s).
+            let escenas = vec![
+                EscenaReel {
+                    indice: 1,
+                    duracion_segundos: 12,
+                    descripcion_visual: "Apertura ágil enfocada en dolor financiero concreto"
+                        .to_string(),
+                    texto_overlay: titulo.chars().take(64).collect(),
+                },
+                EscenaReel {
+                    indice: 2,
+                    duracion_segundos: 16,
+                    descripcion_visual: "Propuesta cuantitativa y diferenciador en México"
+                        .to_string(),
+                    texto_overlay: "Estructura optimizada en MXN".to_string(),
+                },
+                EscenaReel {
+                    indice: 3,
+                    duracion_segundos: 12,
+                    descripcion_visual: "Llamado directo a evaluación consultiva".to_string(),
+                    texto_overlay: "Solicita corrida comparativa".to_string(),
+                },
+            ];
+            let guion = format!(
+                "{titulo}. Si estás evaluando decisiones estratégicas alrededor de {enfoque}, aquí tienes la clave concreta para proteger tu retorno y liquidez en México sin fricción innecesaria. {cta}"
+            );
+            (escenas, guion)
+        }
+    };
+
+    SolicitudVideoMonetizacion {
+        campana_id,
+        vertical,
+        objetivo,
+        titulo,
+        descripcion: format!("Análisis educativo en México sobre {enfoque}. {cta}"),
+        hashtags: tags.into_iter().map(str::to_string).collect(),
+        guion_tts,
+        escenas_reel,
+        perfil_objetivo: perfil,
+    }
 }

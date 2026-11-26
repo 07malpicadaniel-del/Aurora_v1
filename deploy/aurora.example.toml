@@ -114,4 +114,11 @@ organico_intervalo_minutos = 120
 # Portal móvil seguro sobre Tailscale (`GET /mobile`):
 # Si cambias bind_addr a tu IP Tailscale (ej. "100.x.y.z:8090"), define AURORA_MOBILE_TOKEN en secrets.env.
 # Publicación orgánica oficial (inyectar vía ~/.config/aurora/secrets.env):
-# AURORA_YOUTUBE_ACCESS_TOKEN, AURORA_META_IG_USER_ID, AURORA_META_ACCESS_TOKEN, AURORA_META_MEDIA_BASE_URL
+# AURORA_YOUTUBE_ACCESS_TOKEN, AURORA_META_IG_USER_ID, AURORA_META_ACCESS_TOKEN, AURORA_META_MEDIA_BASE_URL,
+# AURORA_TIKTOK_ACCESS_TOKEN, AURORA_TIKTOK_MODE ("inbox" | "direct_post")
+
+[factory]
+# Directorio NVMe de la biblioteca B-Roll e índice Higgsfield (<data_dir>/assets/broll si se omite)
+broll_dir = "~/.local/share/aurora/assets/broll"
+# Puente opcional API Higgsfield (inyectar preferentemente vía AURORA_HIGGSFIELD_API_KEY en secrets.env):
+# higgsfield_api_url = "https://api.higgsfield.ai/v1/generations"

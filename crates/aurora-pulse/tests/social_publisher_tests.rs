@@ -51,6 +51,7 @@ async fn publicador_organico_valida_sha256_y_bloquea_pii_en_carril_verde(
         sha256_mp4: sha256_ok.clone(),
         programado_para: None,
         libre_de_pii: true,
+        objetivo: None,
     };
 
     // 1. Bloqueo si libre_de_pii == false
@@ -128,6 +129,7 @@ async fn publicador_organico_respeta_rate_limit_y_abre_circuit_breaker_ante_429(
         sha256_mp4: sha256_ok,
         programado_para: None,
         libre_de_pii: true,
+        objetivo: None,
     };
 
     let t0 = Utc::now();
@@ -190,6 +192,105 @@ async fn publicador_organico_respeta_rate_limit_y_abre_circuit_breaker_ante_429(
         .await;
     assert!(matches!(
         err_cb,
+        Err(PulseError::CircuitBreakerAbierto { .. })
+    ));
+
+    if let Some(dir) = ruta_mp4.parent() {
+        let _ = fs::remove_dir_all(dir);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn publicador_tiktok_valida_pii_rate_limit_y_circuit_breaker_429(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let politica_tt = PoliticaTasaPlataforma::recomendada(PlataformaPulso::TikTok);
+    assert_eq!(politica_tt.cuota_max_hora, 3);
+    assert_eq!(politica_tt.cuota_max_dia, 10);
+
+    let (ruta_mp4, sha256_ok) = crear_mp4_prueba("reel_tiktok_monetizacion.mp4")?;
+    let rate = Arc::new(ControladorTasaPlataforma::default());
+    rate.configurar_politica(
+        PlataformaPulso::TikTok,
+        PoliticaTasaPlataforma {
+            cuota_max_hora: 3,
+            cuota_max_dia: 10,
+            intervalo_minimo_ms: 5_000,
+            jitter_max_ms: 0,
+            umbral_fallos_circuit_breaker: 2,
+            enfriamiento_circuit_breaker_s: 600,
+        },
+    );
+
+    let mock_tt = Arc::new(DeterministicMockSocialPublisher::new(
+        PlataformaPulso::TikTok,
+    ));
+    let pub_tt = Arc::clone(&mock_tt) as Arc<dyn OrganicSocialPublisher>;
+    let gestor = GestorPublicacionOrganica::new(Arc::clone(&rate)).con_publicador(pub_tt);
+    let telemetria = RecolectorTelemetria::new();
+
+    let sol_limpia = SolicitudPublicacionOrganica {
+        campana_id: Uuid::new_v4(),
+        vertical: VerticalComercial::Inmobiliaria(SubverticalInmobiliaria::ComercialIndustrial),
+        titulo: "Cómo calcular la rentabilidad neta de naves industriales en México".to_string(),
+        descripcion: "Cápsula educativa de 65 segundos sobre nearshoring y flujo en USD sin PII."
+            .to_string(),
+        hashtags: vec!["NearshoringMX".to_string(), "TikTokFinanzas".to_string()],
+        ruta_mp4: ruta_mp4.clone(),
+        sha256_mp4: sha256_ok.clone(),
+        programado_para: None,
+        libre_de_pii: true,
+        objetivo: Some(aurora_pulse::ObjetivoContenidoVideo::MonetizacionAlcance),
+    };
+
+    let t0 = Utc::now();
+
+    let mut con_pii = sol_limpia.clone();
+    con_pii.titulo = "Escríbeme a ventas@cliente-privado.mx para cotizar".to_string();
+    let err_pii = gestor
+        .publicar_en(PlataformaPulso::TikTok, &con_pii, &telemetria, t0)
+        .await;
+    assert!(matches!(err_pii, Err(PulseError::DespachoFallido { .. })));
+
+    let comp = gestor
+        .publicar_en(PlataformaPulso::TikTok, &sol_limpia, &telemetria, t0)
+        .await?;
+    assert_eq!(comp.plataforma, PlataformaPulso::TikTok);
+    assert!(comp.url_publica.starts_with("https://www.tiktok.com/"));
+    assert_eq!(comp.sha256_mp4, sha256_ok);
+
+    mock_tt.inyectar_rate_limit_429(true);
+    let e1 = gestor
+        .publicar_en(
+            PlataformaPulso::TikTok,
+            &sol_limpia,
+            &telemetria,
+            t0 + Duration::seconds(10),
+        )
+        .await;
+    assert!(matches!(e1, Err(PulseError::RateLimitPlataforma { .. })));
+
+    let e2 = gestor
+        .publicar_en(
+            PlataformaPulso::TikTok,
+            &sol_limpia,
+            &telemetria,
+            t0 + Duration::seconds(20),
+        )
+        .await;
+    assert!(matches!(e2, Err(PulseError::RateLimitPlataforma { .. })));
+
+    mock_tt.inyectar_rate_limit_429(false);
+    let e_cb = gestor
+        .publicar_en(
+            PlataformaPulso::TikTok,
+            &sol_limpia,
+            &telemetria,
+            t0 + Duration::seconds(30),
+        )
+        .await;
+    assert!(matches!(
+        e_cb,
         Err(PulseError::CircuitBreakerAbierto { .. })
     ));
 

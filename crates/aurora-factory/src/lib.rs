@@ -14,10 +14,13 @@ pub mod pipeline;
 pub mod tts;
 pub mod video;
 
+pub use aurora_domain::ObjetivoContenidoVideo;
 pub use broll::{
-    validar_firma_mp4_mov, validar_ruta_sin_traversal, BibliotecaBroll, BriefHiggsfield,
-    CatalogoBroll, ClipBroll, ColaBriefsHiggsfield, EstadoBriefHiggsfield, IndiceBroll,
-    SolicitudRegistroClipBroll, MIN_CLIPS_COBERTURA_VERTICAL, TODAS_LAS_VERTICALES,
+    validar_firma_mp4_mov, validar_ruta_sin_traversal, ApiHiggsfieldClient, BibliotecaBroll,
+    BriefHiggsfield, CatalogoBroll, ClipBroll, ColaBriefsHiggsfield, ConfigHiggsfield,
+    EstadoBriefHiggsfield, HiggsfieldProvider, IndiceBroll, ManualQueueHiggsfieldClient,
+    ResultadoGeneracionHiggsfield, SolicitudRegistroClipBroll, DEFAULT_HIGGSFIELD_API_URL,
+    MIN_CLIPS_COBERTURA_VERTICAL, TODAS_LAS_VERTICALES,
 };
 pub use document::{
     construir_png_rgba_transparente_1080x1920, generar_html_dossier, generar_html_escena,
@@ -30,7 +33,9 @@ pub use manifest::{
     construir_metadatos_artefacto, fnv1a_64_bytes, sha256_bytes, MetadatosArtefacto,
     ModoComposicionVideo, PaqueteManufacturado, SolicitudManufactura,
 };
-pub use pipeline::{ConfigFabrica, FabricaMultimodalAurora};
+pub use pipeline::{
+    ConfigFabrica, FabricaMultimodalAurora, PaqueteVideoMonetizacion, SolicitudVideoMonetizacion,
+};
 pub use tts::{
     generar_wav_pcm_silencio, leer_info_wav, length_scale_para_perfil, ConfigPiperCpu,
     DeterministicSilentWavEngine, PiperCpuTtsEngine, ResultadoAudio, TtsEngine,

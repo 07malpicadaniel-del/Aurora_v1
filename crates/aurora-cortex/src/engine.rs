@@ -677,6 +677,38 @@ impl<B: BobInferenceBackend> OrquestadorComercialBob<B> {
         &self.backend
     }
 
+    /// Evalúa únicamente el rol `Perfilador` (GBNF estricto en `slot_id = 0`) para catalogar
+    /// la probabilidad de compra de un prospecto sin construir un brief creativo completo.
+    #[tracing::instrument(skip(self, subgrafo, memoria), fields(prospecto_id = %subgrafo.prospecto.id))]
+    pub async fn evaluar_probabilidad_compra(
+        &self,
+        subgrafo: &SubgrafoProspecto,
+        memoria: &MotorMemoriaAurora,
+    ) -> CortexResult<DiagnosticoComercial> {
+        let prospecto_id = subgrafo.prospecto.id;
+        ToolDispatcher::verificar_habilitacion_lfpdppp(prospecto_id, memoria)?;
+
+        let ctx_perfilador = construir_contexto_perfilador(subgrafo);
+        let gramatica_diag = gbnf_diagnostico_comercial();
+        let raw_diag = self
+            .backend
+            .inferir_estructurado(RolCognitivo::Perfilador, &ctx_perfilador, &gramatica_diag)
+            .await?;
+        let mut diagnostico: DiagnosticoComercial =
+            parsear_respuesta_estricta(&raw_diag, RolCognitivo::Perfilador)?;
+        if diagnostico.prospecto_id != prospecto_id {
+            return Err(CortexError::ViolacionEsquema {
+                rol: RolCognitivo::Perfilador.etiqueta().to_string(),
+                detalle: format!(
+                    "prospecto_id devuelto ({}) no coincide con el subgrafo ({})",
+                    diagnostico.prospecto_id, prospecto_id
+                ),
+            });
+        }
+        reconciliar_vertical_coherente(&mut diagnostico, subgrafo.isla);
+        Ok(diagnostico)
+    }
+
     /// Ejecuta el ciclo `Perfilador -> DirectorCreativo -> ToolDispatcher` para generar un plan listo para Gatekeeper.
     #[tracing::instrument(skip(self, subgrafo, memoria), fields(prospecto_id = %subgrafo.prospecto.id, campana_id = %campana_id))]
     pub async fn generar_plan_ataque(

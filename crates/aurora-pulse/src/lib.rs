@@ -30,11 +30,13 @@ pub use rate_limiter::{
     ControladorTasaPlataforma, EstadoTasaPlataforma, PlataformaPulso, PoliticaTasaPlataforma,
 };
 pub use smtp_transport::{ConfigSmtp, SmtpEmailTransport};
+pub use aurora_domain::ObjetivoContenidoVideo;
 pub use social_publisher::{
-    validar_solicitud_organica, ComprobantePublicacionOrganica, ConfigMetaReels,
+    validar_solicitud_organica, ComprobantePublicacionOrganica, ConfigMetaReels, ConfigTikTok,
     ConfigYouTubeShorts, DeterministicMockSocialPublisher, EstadoPublicadorOrganico,
-    GestorPublicacionOrganica, MetaReelsGraphPublisher, OrganicSocialPublisher,
-    SolicitudPublicacionOrganica, YouTubeShortsApiPublisher, DEFAULT_META_GRAPH_BASE_URL,
+    GestorPublicacionOrganica, MetaReelsGraphPublisher, ModoPublicacionTikTok,
+    OrganicSocialPublisher, SolicitudPublicacionOrganica, TikTokApiPublisher,
+    YouTubeShortsApiPublisher, DEFAULT_META_GRAPH_BASE_URL, DEFAULT_TIKTOK_API_BASE_URL,
     DEFAULT_YOUTUBE_UPLOAD_URL,
 };
 pub use telemetry::{

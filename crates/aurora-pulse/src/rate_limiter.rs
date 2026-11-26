@@ -21,6 +21,8 @@ pub enum PlataformaPulso {
     Instagram,
     /// Publicación orgánica vertical en YouTube Shorts.
     YouTubeShorts,
+    /// Publicación orgánica y monetización vertical en TikTok (Content Posting API v2).
+    TikTok,
     /// Interacción pública en X.
     X,
     /// Llamada directa asistida.
@@ -39,6 +41,7 @@ impl PlataformaPulso {
             Self::LinkedIn => "LinkedIn",
             Self::Instagram => "Instagram",
             Self::YouTubeShorts => "YouTubeShorts",
+            Self::TikTok => "TikTok",
             Self::X => "X",
             Self::LlamadaDirecta => "LlamadaDirecta",
             Self::CamaraEmpresarial => "CamaraEmpresarial",
@@ -54,6 +57,7 @@ impl PlataformaPulso {
             Self::LinkedIn,
             Self::Instagram,
             Self::YouTubeShorts,
+            Self::TikTok,
             Self::X,
             Self::LlamadaDirecta,
             Self::CamaraEmpresarial,
@@ -143,6 +147,14 @@ impl PoliticaTasaPlataforma {
                 intervalo_minimo_ms: 60_000,
                 jitter_max_ms: 15_000,
                 umbral_fallos_circuit_breaker: 3,
+                enfriamiento_circuit_breaker_s: 3_600,
+            },
+            PlataformaPulso::TikTok => Self {
+                cuota_max_hora: 3,
+                cuota_max_dia: 10,
+                intervalo_minimo_ms: 90_000,
+                jitter_max_ms: 20_000,
+                umbral_fallos_circuit_breaker: 2,
                 enfriamiento_circuit_breaker_s: 3_600,
             },
             PlataformaPulso::LlamadaDirecta | PlataformaPulso::CamaraEmpresarial => Self {

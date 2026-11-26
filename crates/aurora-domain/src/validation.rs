@@ -3,7 +3,8 @@ use uuid::Uuid;
 
 use crate::error::{AuroraError, AuroraResult};
 use crate::models::{
-    ActivoGenerado, CampanaVertical, EstadoAprobacion, GatilloVital, Prospecto, RelacionTopologica,
+    ActivoGenerado, CampanaVertical, CatalogacionCompraBob, EstadoAprobacion, GatilloVital,
+    NivelProbabilidadCompra, Prospecto, RelacionTopologica,
 };
 
 /// Verifica que un peso normalizado sea finito y esté dentro de `[0.0, 1.0]`.
@@ -156,6 +157,37 @@ pub fn validar_activo(activo: &ActivoGenerado) -> AuroraResult<()> {
         return Err(AuroraError::Validacion(format!(
             "el activo {} en estado Rechazado requiere motivo_rechazo",
             activo.id
+        )));
+    }
+    Ok(())
+}
+
+/// Valida integridad de una calificación de probabilidad de compra emitida por BOB o heurística 4D.
+pub fn validar_catalogacion_compra(cat: &CatalogacionCompraBob) -> AuroraResult<()> {
+    validar_peso_unitario("probabilidad_compra", cat.probabilidad_compra)?;
+    if !cat.score_topologico_4d.is_finite() || cat.score_topologico_4d < 0.0 {
+        return Err(AuroraError::PesoFueraDeRango {
+            campo: "score_topologico_4d",
+            valor: cat.score_topologico_4d,
+        });
+    }
+    let nivel_esperado = NivelProbabilidadCompra::desde_probabilidad(cat.probabilidad_compra);
+    if cat.nivel != nivel_esperado {
+        return Err(AuroraError::Validacion(format!(
+            "nivel de probabilidad inconsistente ({:?} vs {:?}) para probabilidad {:.3}",
+            cat.nivel, nivel_esperado, cat.probabilidad_compra
+        )));
+    }
+    if cat.producto_recomendado.trim().is_empty() {
+        return Err(AuroraError::Validacion(format!(
+            "la catalogación de {} requiere producto_recomendado no vacío",
+            cat.prospecto_id
+        )));
+    }
+    if cat.justificacion_corta.trim().is_empty() {
+        return Err(AuroraError::Validacion(format!(
+            "la catalogación de {} requiere justificacion_corta no vacía",
+            cat.prospecto_id
         )));
     }
     Ok(())

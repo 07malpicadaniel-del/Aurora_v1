@@ -555,3 +555,152 @@ async fn prueba_real_nvenc_broll_en_vivo_si_habilitada(
     let _ = fs::remove_dir_all(&tmp);
     Ok(())
 }
+
+#[tokio::test]
+async fn higgsfield_provider_fallback_manual_api_y_objetivo_monetizacion_61s(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use aurora_factory::{
+        ApiHiggsfieldClient, ConfigHiggsfield, HiggsfieldProvider, ManualQueueHiggsfieldClient,
+        ObjetivoContenidoVideo, SolicitudVideoMonetizacion,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let tmp = dir_temporal("aurora_higgsfield_monetizacion");
+    let broll_dir = tmp.join("broll");
+    let factory_dir = tmp.join("factory");
+    let vertical = VerticalComercial::Seguros(SubverticalSeguros::HombreClave);
+
+    let bib_lock = Arc::new(tokio::sync::Mutex::new(BibliotecaBroll::abrir(&broll_dir)?));
+    let brief = {
+        let mut bib = bib_lock.lock().await;
+        bib.generar_briefs_higgsfield(vertical, PerfilPsicologico::AnaliticoFinanciero, 1)?
+            .into_iter()
+            .next()
+            .ok_or("no se generó brief Higgsfield")?
+    };
+
+    let manual = ManualQueueHiggsfieldClient;
+    assert!(!manual.modo_real_configurado());
+    let res_manual = manual.solicitar_o_encolar_clip(&brief, &bib_lock).await?;
+    assert!(!res_manual.modo_real_api);
+    assert!(res_manual.clip_registrado.is_none());
+
+    let api_sin_key = ApiHiggsfieldClient::new(ConfigHiggsfield::default())?;
+    assert!(!api_sin_key.modo_real_configurado());
+    let res_fallback = api_sin_key
+        .solicitar_o_encolar_clip(&brief, &bib_lock)
+        .await?;
+    assert!(!res_fallback.modo_real_api);
+    assert!(res_fallback.clip_registrado.is_none());
+
+    let mp4_bytes = construir_mp4_valido_sintetico("higgsfield_api_mock");
+    let mp4_para_srv = mp4_bytes.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let srv_handle = tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0_u8; 4096];
+            let _ = stream.read(&mut buf).await;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                mp4_para_srv.len()
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(&mp4_para_srv).await;
+        }
+    });
+
+    let api_real = ApiHiggsfieldClient::new(ConfigHiggsfield {
+        api_key: Some("hf_test_key_local".to_string()),
+        api_url: format!("http://{addr}/v1/generations"),
+        timeout_ms: 5_000,
+    })?;
+    assert!(api_real.modo_real_configurado());
+
+    let res_api = api_real
+        .solicitar_o_encolar_clip(&brief, &bib_lock)
+        .await?;
+    let _ = srv_handle.await;
+    assert!(res_api.modo_real_api);
+    let clip = res_api
+        .clip_registrado
+        .ok_or("ApiHiggsfieldClient debía registrar clip MP4 automáticamente")?;
+    assert!(clip.ruta_nvme.is_file());
+    assert_eq!(res_api.brief_encolado.estado, EstadoBriefHiggsfield::Importado);
+
+    let fabrica = FabricaMultimodalAurora::new(
+        ConfigFabrica {
+            directorio_base: factory_dir,
+        },
+        DeterministicSilentWavEngine,
+        DeterministicMockDocumentEngine,
+        DeterministicMockVideoComposer,
+    )
+    .con_biblioteca_broll(Arc::clone(&bib_lock));
+
+    let solicitud_corta = SolicitudVideoMonetizacion {
+        campana_id: Uuid::new_v4(),
+        vertical,
+        objetivo: ObjetivoContenidoVideo::MonetizacionAlcance,
+        titulo: "Video demasiado corto para Creator Rewards".to_string(),
+        descripcion: "Debe rechazarse por ser menor a 61 segundos.".to_string(),
+        hashtags: vec!["HombreClave".to_string()],
+        guion_tts: "Guion breve de prueba.".to_string(),
+        escenas_reel: vec![EscenaReel {
+            indice: 1,
+            duracion_segundos: 30,
+            descripcion_visual: "Escena corta".to_string(),
+            texto_overlay: "Solo 30 segundos".to_string(),
+        }],
+        perfil_objetivo: PerfilPsicologico::AnaliticoFinanciero,
+    };
+    let err_corta = fabrica
+        .manufacturar_video_monetizacion(&solicitud_corta)
+        .await;
+    assert!(matches!(err_corta, Err(FactoryError::DatosInvalidos(_))));
+
+    let solicitud_65s = SolicitudVideoMonetizacion {
+        campana_id: Uuid::new_v4(),
+        vertical,
+        objetivo: ObjetivoContenidoVideo::MonetizacionAlcance,
+        titulo: "Cómo deducir Seguro Hombre Clave en México".to_string(),
+        descripcion: "Análisis educativo sobre Art. 27 LISR sin PII.".to_string(),
+        hashtags: vec!["HombreClave".to_string(), "LISR".to_string()],
+        guion_tts: "Guía educativa sobre protección de socios clave y deducibilidad fiscal corporativa en México.".to_string(),
+        escenas_reel: vec![
+            EscenaReel {
+                indice: 1,
+                duracion_segundos: 20,
+                descripcion_visual: "Apertura ejecutiva".to_string(),
+                texto_overlay: "Art. 27 Fracc. XI LISR".to_string(),
+            },
+            EscenaReel {
+                indice: 2,
+                duracion_segundos: 25,
+                descripcion_visual: "Desglose cuantitativo".to_string(),
+                texto_overlay: "Protege liquidez corporativa".to_string(),
+            },
+            EscenaReel {
+                indice: 3,
+                duracion_segundos: 20,
+                descripcion_visual: "Cierre educativo inbound".to_string(),
+                texto_overlay: "Guarda este análisis".to_string(),
+            },
+        ],
+        perfil_objetivo: PerfilPsicologico::AnaliticoFinanciero,
+    };
+
+    let paquete = fabrica
+        .manufacturar_video_monetizacion(&solicitud_65s)
+        .await?;
+    assert_eq!(paquete.modo_video, ModoComposicionVideo::CinematograficoBroll);
+    assert_eq!(paquete.clips_broll_usados, vec![clip.id]);
+    assert!(paquete.duracion_estimada_seg >= 61);
+    assert!(paquete.elegible_creator_rewards_tiktok);
+    assert!(paquete.reel_vertical_mp4.ruta_nvme.is_file());
+    assert_eq!(paquete.reel_vertical_mp4.sha256_hex.len(), 64);
+
+    let _ = fs::remove_dir_all(&tmp);
+    Ok(())
+}

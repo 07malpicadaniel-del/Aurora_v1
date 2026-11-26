@@ -7,8 +7,11 @@ use aurora_council::{
     ConfigCuotasConsejo, MiembroConsejo, PoliticaCuotaProveedor, DEFAULT_COUNCIL_CLI_TIMEOUT_MS,
 };
 use aurora_domain::VerticalComercial;
+use aurora_factory::{ConfigHiggsfield, DEFAULT_HIGGSFIELD_API_URL};
 use aurora_osint::{ConfigCdpFetcher, HttpCdpBrowserFetcher};
-use aurora_pulse::{ConfigMetaReels, ConfigSmtp, ConfigYouTubeShorts};
+use aurora_pulse::{
+    ConfigMetaReels, ConfigSmtp, ConfigTikTok, ConfigYouTubeShorts, ModoPublicacionTikTok,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
@@ -167,6 +170,10 @@ impl Default for ConfigSchedulerAfk {
 pub struct ConfigFactoryDaemon {
     /// Directorio NVMe de la biblioteca B-Roll e índice Higgsfield (`<data_dir>/assets/broll` por defecto).
     pub broll_dir: Option<PathBuf>,
+    /// Clave API de Higgsfield (`AURORA_HIGGSFIELD_API_KEY`); si se omite usa cola manual local.
+    pub higgsfield_api_key: Option<String>,
+    /// Endpoint HTTP de Higgsfield (`AURORA_HIGGSFIELD_API_URL`).
+    pub higgsfield_api_url: Option<String>,
 }
 
 /// Configuración de la sección `[forge]` en `aurora.toml`.
@@ -253,6 +260,10 @@ pub struct AuroraDaemonConfig {
     pub meta_access_token: Option<String>,
     /// URL pública HTTPS base para entrega de `video_url` a Meta Graph (`AURORA_META_MEDIA_BASE_URL`).
     pub meta_media_base_url: Option<String>,
+    /// Token OAuth 2.0 de TikTok Content Posting API v2 (`AURORA_TIKTOK_ACCESS_TOKEN`).
+    pub tiktok_access_token: Option<String>,
+    /// Modo de publicación TikTok: `"inbox"` (borrador seguro) o `"direct_post"` (`AURORA_TIKTOK_MODE`).
+    pub tiktok_modo_publicacion: Option<String>,
     /// Configuración SMTP (`lettre` + `tokio1-rustls-tls`) y cumplimiento LFPDPPP `List-Unsubscribe`.
     pub smtp: ConfigSmtp,
     /// Configuración del Consejo Multi-Agente (`aurora-council`) y límites de cuotas NVMe.
@@ -296,6 +307,8 @@ impl Default for AuroraDaemonConfig {
             meta_ig_user_id: None,
             meta_access_token: None,
             meta_media_base_url: None,
+            tiktok_access_token: None,
+            tiktok_modo_publicacion: None,
             smtp: ConfigSmtp::default(),
             council: ConfigCouncilDaemon::default(),
             factory: ConfigFactoryDaemon::default(),
@@ -494,6 +507,27 @@ impl AuroraDaemonConfig {
         self.data_dir_resuelto().join("forge_ordenes.json")
     }
 
+    /// Ruta del archivo JSON persistente de catalogación de probabilidad de compra en `<wal_dir>`.
+    #[must_use]
+    pub fn catalogacion_path_efectivo(&self) -> PathBuf {
+        self.wal_dir_efectivo().join("catalogacion_compra.json")
+    }
+
+    /// Construye la configuración de [`aurora_factory::ApiHiggsfieldClient`] desde `[factory]`.
+    #[must_use]
+    pub fn config_higgsfield(&self) -> ConfigHiggsfield {
+        ConfigHiggsfield {
+            api_key: self.factory.higgsfield_api_key.clone(),
+            api_url: self
+                .factory
+                .higgsfield_api_url
+                .clone()
+                .filter(|u| !u.trim().is_empty())
+                .unwrap_or_else(|| DEFAULT_HIGGSFIELD_API_URL.to_string()),
+            ..ConfigHiggsfield::default()
+        }
+    }
+
     /// Indica si `bind_addr` escucha fuera de loopback local (ej. interfaz Tailscale `100.x.y.z:8090`).
     #[must_use]
     pub fn es_bind_remoto_o_tailscale(&self) -> bool {
@@ -527,6 +561,21 @@ impl AuroraDaemonConfig {
             access_token: self.meta_access_token.clone(),
             media_public_base_url: self.meta_media_base_url.clone(),
             ..ConfigMetaReels::default()
+        }
+    }
+
+    /// Construye la configuración de [`aurora_pulse::TikTokApiPublisher`] (Content Posting API v2).
+    #[must_use]
+    pub fn config_tiktok(&self) -> ConfigTikTok {
+        let modo = self
+            .tiktok_modo_publicacion
+            .as_deref()
+            .map(ModoPublicacionTikTok::desde_str)
+            .unwrap_or_default();
+        ConfigTikTok {
+            access_token: self.tiktok_access_token.clone(),
+            modo_publicacion: modo,
+            ..ConfigTikTok::default()
         }
     }
 
@@ -585,6 +634,14 @@ impl AuroraDaemonConfig {
         }
         if let Some(v) = leer_env("AURORA_BROLL_DIR").filter(|s| !s.trim().is_empty()) {
             self.factory.broll_dir = Some(PathBuf::from(v.trim()));
+        }
+        if let Some(v) = leer_env("AURORA_HIGGSFIELD_API_KEY") {
+            let limpio = v.trim().to_string();
+            self.factory.higgsfield_api_key = if limpio.is_empty() { None } else { Some(limpio) };
+        }
+        if let Some(v) = leer_env("AURORA_HIGGSFIELD_API_URL") {
+            let limpio = v.trim().to_string();
+            self.factory.higgsfield_api_url = if limpio.is_empty() { None } else { Some(limpio) };
         }
         if let Some(v) = leer_env("AURORA_DPO_DIR").filter(|s| !s.trim().is_empty()) {
             self.dpo_dir = Some(PathBuf::from(v.trim()));
@@ -757,6 +814,14 @@ impl AuroraDaemonConfig {
         if let Some(v) = leer_env("AURORA_META_MEDIA_BASE_URL") {
             let limpio = v.trim().trim_end_matches('/').to_string();
             self.meta_media_base_url = if limpio.is_empty() { None } else { Some(limpio) };
+        }
+        if let Some(v) = leer_env("AURORA_TIKTOK_ACCESS_TOKEN") {
+            let limpio = v.trim().to_string();
+            self.tiktok_access_token = if limpio.is_empty() { None } else { Some(limpio) };
+        }
+        if let Some(v) = leer_env("AURORA_TIKTOK_MODE") {
+            let limpio = v.trim().to_string();
+            self.tiktok_modo_publicacion = if limpio.is_empty() { None } else { Some(limpio) };
         }
         if let Some(v) =
             leer_env("AURORA_SCHEDULER_HUNT_HABILITADO").filter(|s| !s.trim().is_empty())

@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use aurora_council::PiiFirewall;
-use aurora_domain::{SubverticalInmobiliaria, SubverticalSeguros, VerticalComercial};
+use aurora_domain::{
+    ObjetivoContenidoVideo, SubverticalInmobiliaria, SubverticalSeguros, VerticalComercial,
+};
 use aurora_factory::{sha256_bytes, validar_firma_mp4_mov, validar_ruta_sin_traversal};
 use aurora_memory::IslaVertical;
 use chrono::{DateTime, Utc};
@@ -26,6 +28,9 @@ pub const DEFAULT_YOUTUBE_UPLOAD_URL: &str =
 
 /// Base oficial de Meta Graph API para publicación de Instagram Reels.
 pub const DEFAULT_META_GRAPH_BASE_URL: &str = "https://graph.facebook.com/v21.0";
+
+/// Base oficial de TikTok Content Posting API v2.
+pub const DEFAULT_TIKTOK_API_BASE_URL: &str = "https://open.tiktokapis.com";
 
 /// Solicitud de publicación de contenido orgánico educativo (Carril Verde, cero PII).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,6 +55,9 @@ pub struct SolicitudPublicacionOrganica {
     pub programado_para: Option<DateTime<Utc>>,
     /// Declaración obligatoria de que la pieza pertenece al Carril Verde sin PII.
     pub libre_de_pii: bool,
+    /// Objetivo estratégico dual opcional (`MonetizacionAlcance` o `VentaDirectaProspecto`).
+    #[serde(default)]
+    pub objetivo: Option<ObjetivoContenidoVideo>,
 }
 
 /// Comprobante verificable emitido tras publicar un Reel orgánico.
@@ -721,6 +729,320 @@ impl OrganicSocialPublisher for MetaReelsGraphPublisher {
     }
 }
 
+/// Modo de publicación soportado por TikTok Content Posting API v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModoPublicacionTikTok {
+    /// Sube el video a la bandeja de borradores (`inbox`) para confirmación/sonido final en app.
+    #[default]
+    Inbox,
+    /// Publica directamente en el perfil autorizado (`direct_post`).
+    DirectPost,
+}
+
+impl ModoPublicacionTikTok {
+    /// Interpreta el modo desde texto (`"direct_post"` o `"inbox"`).
+    #[must_use]
+    pub fn desde_str(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "direct_post" | "direct" | "publicar" => Self::DirectPost,
+            _ => Self::Inbox,
+        }
+    }
+
+    /// Etiqueta estable del modo de publicación TikTok.
+    #[must_use]
+    pub const fn etiqueta(&self) -> &'static str {
+        match self {
+            Self::Inbox => "inbox",
+            Self::DirectPost => "direct_post",
+        }
+    }
+}
+
+/// Configuración oficial para [`TikTokApiPublisher`] (Content Posting API v2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigTikTok {
+    /// Token OAuth 2.0 con scope `video.publish` / `video.upload` (`AURORA_TIKTOK_ACCESS_TOKEN`).
+    pub access_token: Option<String>,
+    /// URL base de TikTok Open API (`https://open.tiktokapis.com`).
+    pub api_base_url: String,
+    /// Modo de publicación: `Inbox` (borrador seguro) o `DirectPost` (publicación directa).
+    pub modo_publicacion: ModoPublicacionTikTok,
+    /// Nivel de privacidad para `direct_post` (`"PUBLIC_TO_EVERYONE"`, `"SELF_ONLY"`, etc.).
+    pub privacy_level: String,
+    /// Timeout HTTP en milisegundos.
+    pub timeout_ms: u64,
+}
+
+impl Default for ConfigTikTok {
+    fn default() -> Self {
+        Self {
+            access_token: None,
+            api_base_url: DEFAULT_TIKTOK_API_BASE_URL.to_string(),
+            modo_publicacion: ModoPublicacionTikTok::Inbox,
+            privacy_level: "PUBLIC_TO_EVERYONE".to_string(),
+            timeout_ms: 60_000,
+        }
+    }
+}
+
+impl ConfigTikTok {
+    /// Carga configuración desde variables de entorno (`AURORA_TIKTOK_ACCESS_TOKEN`, `AURORA_TIKTOK_MODE`).
+    #[must_use]
+    pub fn desde_entorno() -> Self {
+        let mut cfg = Self::default();
+        if let Ok(tok) = std::env::var("AURORA_TIKTOK_ACCESS_TOKEN") {
+            let limpio = tok.trim().to_string();
+            if !limpio.is_empty() {
+                cfg.access_token = Some(limpio);
+            }
+        }
+        if let Ok(modo) = std::env::var("AURORA_TIKTOK_MODE") {
+            if !modo.trim().is_empty() {
+                cfg.modo_publicacion = ModoPublicacionTikTok::desde_str(&modo);
+            }
+        }
+        cfg
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TikTokInitEnvelope {
+    data: Option<TikTokInitData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TikTokInitData {
+    publish_id: Option<String>,
+    upload_url: Option<String>,
+}
+
+/// Adaptador oficial de **TikTok Content Posting API v2** (`reqwest` + `rustls-tls`).
+///
+/// Soporta flujo `inbox` (`/v2/post/publish/inbox/video/init/`) y publicación directa
+/// (`direct_post`, `/v2/post/publish/video/init/`) cargando el `.mp4` sellado con SHA-256.
+pub struct TikTokApiPublisher {
+    config: ConfigTikTok,
+    http: Client,
+}
+
+impl TikTokApiPublisher {
+    /// Construye el cliente HTTP `rustls-tls` para TikTok Content Posting API v2.
+    pub fn new(config: ConfigTikTok) -> PulseResult<Self> {
+        let http = Client::builder()
+            .timeout(Duration::from_millis(config.timeout_ms.max(1_000)))
+            .build()
+            .map_err(|e| PulseError::DespachoFallido {
+                canal: PlataformaPulso::TikTok.etiqueta().to_string(),
+                tracking_id: None,
+                detalle: format!("error creando cliente HTTP TikTok: {e}"),
+            })?;
+        Ok(Self { config, http })
+    }
+}
+
+#[async_trait]
+impl OrganicSocialPublisher for TikTokApiPublisher {
+    fn plataforma(&self) -> PlataformaPulso {
+        PlataformaPulso::TikTok
+    }
+
+    fn modo_real_configurado(&self) -> bool {
+        self.config
+            .access_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty())
+    }
+
+    fn detalle_configuracion(&self) -> String {
+        if self.modo_real_configurado() {
+            format!(
+                "TikTok Content Posting API v2 lista (modo={})",
+                self.config.modo_publicacion.etiqueta()
+            )
+        } else {
+            "Sin AURORA_TIKTOK_ACCESS_TOKEN (usará simulación offline segura)".to_string()
+        }
+    }
+
+    async fn publicar_reel_organico(
+        &self,
+        solicitud: &SolicitudPublicacionOrganica,
+    ) -> PulseResult<ComprobantePublicacionOrganica> {
+        let video_bytes = validar_solicitud_organica(solicitud).await?;
+        let token = self
+            .config
+            .access_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| PulseError::DespachoFallido {
+                canal: self.plataforma().etiqueta().to_string(),
+                tracking_id: None,
+                detalle: "falta AURORA_TIKTOK_ACCESS_TOKEN para publicar en TikTok".to_string(),
+            })?;
+
+        let base = self.config.api_base_url.trim_end_matches('/');
+        let init_path = match self.config.modo_publicacion {
+            ModoPublicacionTikTok::Inbox => "/v2/post/publish/inbox/video/init/",
+            ModoPublicacionTikTok::DirectPost => "/v2/post/publish/video/init/",
+        };
+        let init_url = format!("{base}{init_path}");
+
+        let hashtags = solicitud
+            .hashtags
+            .iter()
+            .map(|h| format!("#{}", h.trim().trim_start_matches('#')))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let caption = format!("{} {}", solicitud.titulo.trim(), hashtags)
+            .trim()
+            .chars()
+            .take(2_200)
+            .collect::<String>();
+
+        let total_size = video_bytes.len();
+        let source_info = serde_json::json!({
+            "source": "FILE_UPLOAD",
+            "video_size": total_size,
+            "chunk_size": total_size,
+            "total_chunk_count": 1,
+        });
+
+        let init_body = match self.config.modo_publicacion {
+            ModoPublicacionTikTok::Inbox => serde_json::json!({
+                "source_info": source_info,
+            }),
+            ModoPublicacionTikTok::DirectPost => serde_json::json!({
+                "post_info": {
+                    "title": caption,
+                    "privacy_level": self.config.privacy_level,
+                    "disable_duet": false,
+                    "disable_comment": false,
+                    "disable_stitch": false,
+                },
+                "source_info": source_info,
+            }),
+        };
+
+        let init_resp = self
+            .http
+            .post(&init_url)
+            .bearer_auth(token)
+            .header("Content-Type", "application/json; charset=UTF-8")
+            .json(&init_body)
+            .send()
+            .await
+            .map_err(|e| PulseError::DespachoFallido {
+                canal: self.plataforma().etiqueta().to_string(),
+                tracking_id: None,
+                detalle: format!("error iniciando carga en TikTok Content Posting API v2: {e}"),
+            })?;
+
+        if init_resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Err(PulseError::RateLimitPlataforma {
+                plataforma: self.plataforma().etiqueta().to_string(),
+                motivo: "HTTP 429 en init de TikTok Content Posting API v2".to_string(),
+                esperar_ms: 90_000,
+            });
+        }
+
+        if !init_resp.status().is_success() {
+            let code = init_resp.status().as_u16();
+            let cuerpo = init_resp.text().await.unwrap_or_default();
+            return Err(PulseError::DespachoFallido {
+                canal: self.plataforma().etiqueta().to_string(),
+                tracking_id: None,
+                detalle: format!("TikTok rechazó init de video (HTTP {code}): {cuerpo}"),
+            });
+        }
+
+        let envelope: TikTokInitEnvelope = init_resp.json().await.map_err(|e| {
+            PulseError::DespachoFallido {
+                canal: self.plataforma().etiqueta().to_string(),
+                tracking_id: None,
+                detalle: format!("JSON inválido en init de TikTok: {e}"),
+            }
+        })?;
+        let data = envelope.data.ok_or_else(|| PulseError::DespachoFallido {
+            canal: self.plataforma().etiqueta().to_string(),
+            tracking_id: None,
+            detalle: "respuesta TikTok init sin bloque data".to_string(),
+        })?;
+        let publish_id = data
+            .publish_id
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| PulseError::DespachoFallido {
+                canal: self.plataforma().etiqueta().to_string(),
+                tracking_id: None,
+                detalle: "respuesta TikTok init sin publish_id".to_string(),
+            })?;
+        let upload_url = data
+            .upload_url
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| PulseError::DespachoFallido {
+                canal: self.plataforma().etiqueta().to_string(),
+                tracking_id: None,
+                detalle: "respuesta TikTok init sin upload_url".to_string(),
+            })?;
+
+        let last_byte = total_size.saturating_sub(1);
+        let content_range = format!("bytes 0-{last_byte}/{total_size}");
+        let upload_resp = self
+            .http
+            .put(&upload_url)
+            .header("Content-Type", "video/mp4")
+            .header("Content-Range", content_range)
+            .body(video_bytes)
+            .send()
+            .await
+            .map_err(|e| PulseError::DespachoFallido {
+                canal: self.plataforma().etiqueta().to_string(),
+                tracking_id: None,
+                detalle: format!("error subiendo binario MP4 a TikTok: {e}"),
+            })?;
+
+        if upload_resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Err(PulseError::RateLimitPlataforma {
+                plataforma: self.plataforma().etiqueta().to_string(),
+                motivo: "HTTP 429 subiendo binario MP4 a TikTok".to_string(),
+                esperar_ms: 90_000,
+            });
+        }
+
+        if !upload_resp.status().is_success() {
+            let code = upload_resp.status().as_u16();
+            let cuerpo = upload_resp.text().await.unwrap_or_default();
+            return Err(PulseError::DespachoFallido {
+                canal: self.plataforma().etiqueta().to_string(),
+                tracking_id: None,
+                detalle: format!("TikTok rechazó PUT de video MP4 (HTTP {code}): {cuerpo}"),
+            });
+        }
+
+        let url_publica = match self.config.modo_publicacion {
+            ModoPublicacionTikTok::Inbox => {
+                format!("https://www.tiktok.com/creator-center/upload?publish_id={publish_id}")
+            }
+            ModoPublicacionTikTok::DirectPost => {
+                format!("https://www.tiktok.com/@aurora/video/{publish_id}")
+            }
+        };
+
+        Ok(ComprobantePublicacionOrganica {
+            publicacion_id: Uuid::new_v4(),
+            campana_id: solicitud.campana_id,
+            plataforma: PlataformaPulso::TikTok,
+            id_remoto: publish_id,
+            url_publica,
+            sha256_mp4: solicitud.sha256_mp4.to_ascii_lowercase(),
+            publicado_en: Utc::now(),
+            simulado: false,
+        })
+    }
+}
+
 /// Publicador determinista offline para pruebas CI y modo `SimuladoOffline` / `RealConFallback`.
 #[derive(Debug)]
 pub struct DeterministicMockSocialPublisher {
@@ -779,12 +1101,14 @@ impl OrganicSocialPublisher for DeterministicMockSocialPublisher {
         let prefijo = match self.plataforma {
             PlataformaPulso::YouTubeShorts => "yt_short",
             PlataformaPulso::Instagram => "ig_reel",
+            PlataformaPulso::TikTok => "tt_video",
             _ => "org_reel",
         };
         let id_remoto = format!("{prefijo}_{}", &publicacion_id.simple().to_string()[..12]);
         let url_publica = match self.plataforma {
             PlataformaPulso::YouTubeShorts => format!("https://youtube.com/shorts/{id_remoto}"),
             PlataformaPulso::Instagram => format!("https://www.instagram.com/reel/{id_remoto}/"),
+            PlataformaPulso::TikTok => format!("https://www.tiktok.com/@aurora/video/{id_remoto}"),
             _ => format!("https://aurora.local/organico/{id_remoto}"),
         };
 

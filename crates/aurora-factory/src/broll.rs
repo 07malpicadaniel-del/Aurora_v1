@@ -2,17 +2,24 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
+use async_trait::async_trait;
 use aurora_domain::{
     PerfilPsicologico, SubverticalInmobiliaria, SubverticalSeguros, VerticalComercial,
 };
 use chrono::{DateTime, Utc};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::error::{FactoryError, FactoryResult};
 use crate::manifest::sha256_bytes;
+
+/// Endpoint oficial por defecto de la API de generación cinematográfica Higgsfield.
+pub const DEFAULT_HIGGSFIELD_API_URL: &str = "https://api.higgsfield.ai/v1/generations";
 
 /// Cantidad mínima recomendada de clips maestros B-Roll por vertical para evitar repetición visual.
 pub const MIN_CLIPS_COBERTURA_VERTICAL: usize = 3;
@@ -515,6 +522,20 @@ impl BibliotecaBroll {
         Ok(brief_actualizado)
     }
 
+    /// Inserta `brief` en la cola persistida si no existe todavía un brief con el mismo `id`.
+    pub fn registrar_brief_si_no_existe(
+        &mut self,
+        brief: BriefHiggsfield,
+    ) -> FactoryResult<BriefHiggsfield> {
+        if let Some(existente) = self.cola_briefs.briefs.iter().find(|b| b.id == brief.id) {
+            return Ok(existente.clone());
+        }
+        self.cola_briefs.briefs.push(brief.clone());
+        self.cola_briefs.actualizado_en = Some(Utc::now());
+        self.persistir_cola_briefs()?;
+        Ok(brief)
+    }
+
     fn persistir_indice(&self) -> FactoryResult<()> {
         let ruta = self.broll_dir.join("index.json");
         persistir_json_atomico(&ruta, &self.indice)
@@ -778,4 +799,321 @@ fn plantillas_higgsfield(
     base.into_iter()
         .map(|(escena, camara, dur)| (format!("{escena}; lighting & look: {tono_estetico}."), camara, dur))
         .collect()
+}
+
+/// Configuración para conectar [`ApiHiggsfieldClient`] con la API de Higgsfield.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigHiggsfield {
+    /// Clave API (`AURORA_HIGGSFIELD_API_KEY`); si es `None`, opera con cola manual local.
+    pub api_key: Option<String>,
+    /// URL del endpoint de generación de video (`AURORA_HIGGSFIELD_API_URL`).
+    pub api_url: String,
+    /// Timeout HTTP en milisegundos.
+    pub timeout_ms: u64,
+}
+
+impl Default for ConfigHiggsfield {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            api_url: DEFAULT_HIGGSFIELD_API_URL.to_string(),
+            timeout_ms: 90_000,
+        }
+    }
+}
+
+impl ConfigHiggsfield {
+    /// Construye la configuración leyendo `AURORA_HIGGSFIELD_API_KEY` y `AURORA_HIGGSFIELD_API_URL`.
+    #[must_use]
+    pub fn desde_entorno() -> Self {
+        let mut cfg = Self::default();
+        if let Ok(key) = std::env::var("AURORA_HIGGSFIELD_API_KEY") {
+            let limpio = key.trim().to_string();
+            if !limpio.is_empty() {
+                cfg.api_key = Some(limpio);
+            }
+        }
+        if let Ok(url) = std::env::var("AURORA_HIGGSFIELD_API_URL") {
+            let limpio = url.trim().to_string();
+            if !limpio.is_empty() {
+                cfg.api_url = limpio;
+            }
+        }
+        cfg
+    }
+
+    /// Indica si existe una clave API no vacía y una URL válida configurada.
+    #[must_use]
+    pub fn esta_configurado(&self) -> bool {
+        self.api_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty())
+            && !self.api_url.trim().is_empty()
+    }
+}
+
+/// Resultado de solicitar un clip cinematográfico a un [`HiggsfieldProvider`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultadoGeneracionHiggsfield {
+    /// Clip `.mp4` descargado, verificado y registrado automáticamente en [`BibliotecaBroll`] (`None` en modo cola manual).
+    pub clip_registrado: Option<ClipBroll>,
+    /// Brief procesado o encolado en `higgsfield_queue.json`.
+    pub brief_encolado: BriefHiggsfield,
+    /// `true` cuando el clip fue generado y descargado mediante la API real de Higgsfield.
+    pub modo_real_api: bool,
+    /// Resumen operativo legible para bitácora y UI.
+    pub detalle: String,
+}
+
+/// Proveedor asíncrono para generación o encolamiento de clips B-Roll de Higgsfield.
+#[async_trait]
+pub trait HiggsfieldProvider: Send + Sync {
+    /// Indica si este proveedor cuenta con credenciales API reales listas.
+    fn modo_real_configurado(&self) -> bool;
+
+    /// Descripción técnica corta para diagnóstico de subsistemas.
+    fn detalle_configuracion(&self) -> String;
+
+    /// Genera y registra automáticamente un clip desde Higgsfield o encola el brief en modo manual.
+    async fn solicitar_o_encolar_clip(
+        &self,
+        brief: &BriefHiggsfield,
+        biblioteca: &Mutex<BibliotecaBroll>,
+    ) -> FactoryResult<ResultadoGeneracionHiggsfield>;
+}
+
+/// Respaldo determinista sin API key: persiste el brief en la cola manual local de `BibliotecaBroll`.
+#[derive(Debug, Default, Clone)]
+pub struct ManualQueueHiggsfieldClient;
+
+#[async_trait]
+impl HiggsfieldProvider for ManualQueueHiggsfieldClient {
+    fn modo_real_configurado(&self) -> bool {
+        false
+    }
+
+    fn detalle_configuracion(&self) -> String {
+        "Modo cola manual NVMe (sin AURORA_HIGGSFIELD_API_KEY; copia prompts y sube MP4)"
+            .to_string()
+    }
+
+    async fn solicitar_o_encolar_clip(
+        &self,
+        brief: &BriefHiggsfield,
+        biblioteca: &Mutex<BibliotecaBroll>,
+    ) -> FactoryResult<ResultadoGeneracionHiggsfield> {
+        let brief_guardado = {
+            let mut bib = biblioteca.lock().await;
+            bib.registrar_brief_si_no_existe(brief.clone())?
+        };
+        Ok(ResultadoGeneracionHiggsfield {
+            clip_registrado: None,
+            brief_encolado: brief_guardado,
+            modo_real_api: false,
+            detalle: "Brief encolado en modo manual Higgsfield (pendiente de importación MP4 local)"
+                .to_string(),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct HiggsfieldApiResponse {
+    video_url: Option<String>,
+    download_url: Option<String>,
+}
+
+/// Cliente HTTP `reqwest` (`rustls-tls`) para la API de generación B-Roll de Higgsfield.
+///
+/// Cuando `api_key` está ausente degrada automáticamente al flujo de cola manual sin fallar.
+#[derive(Debug, Clone)]
+pub struct ApiHiggsfieldClient {
+    config: ConfigHiggsfield,
+    http: Client,
+}
+
+impl ApiHiggsfieldClient {
+    /// Construye el cliente HTTP para Higgsfield con timeouts acotados.
+    pub fn new(config: ConfigHiggsfield) -> FactoryResult<Self> {
+        let http = Client::builder()
+            .timeout(Duration::from_millis(config.timeout_ms.max(2_000)))
+            .build()
+            .map_err(|e| {
+                FactoryError::DatosInvalidos(format!(
+                    "no se pudo inicializar cliente HTTP de Higgsfield: {e}"
+                ))
+            })?;
+        Ok(Self { config, http })
+    }
+}
+
+#[async_trait]
+impl HiggsfieldProvider for ApiHiggsfieldClient {
+    fn modo_real_configurado(&self) -> bool {
+        self.config.esta_configurado()
+    }
+
+    fn detalle_configuracion(&self) -> String {
+        if self.config.esta_configurado() {
+            format!(
+                "API Higgsfield configurada ({})",
+                self.config.api_url.trim()
+            )
+        } else {
+            "API Higgsfield sin AURORA_HIGGSFIELD_API_KEY (fallback automático a cola manual)"
+                .to_string()
+        }
+    }
+
+    async fn solicitar_o_encolar_clip(
+        &self,
+        brief: &BriefHiggsfield,
+        biblioteca: &Mutex<BibliotecaBroll>,
+    ) -> FactoryResult<ResultadoGeneracionHiggsfield> {
+        let Some(api_key) = self
+            .config
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        else {
+            return ManualQueueHiggsfieldClient
+                .solicitar_o_encolar_clip(brief, biblioteca)
+                .await;
+        };
+
+        let brief_en_cola = {
+            let mut bib = biblioteca.lock().await;
+            bib.registrar_brief_si_no_existe(brief.clone())?
+        };
+
+        let payload = serde_json::json!({
+            "prompt": brief_en_cola.escena_visual_en,
+            "aspect_ratio": brief_en_cola.relacion_aspecto,
+            "duration_sec": brief_en_cola.duracion_objetivo_seg,
+            "camera_motion": brief_en_cola.movimiento_camara,
+            "silent_broll": true,
+        });
+
+        let resp = self
+            .http
+            .post(self.config.api_url.trim())
+            .bearer_auth(api_key)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| {
+                FactoryError::DatosInvalidos(format!("error invocando API Higgsfield: {e}"))
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let cuerpo = resp.text().await.unwrap_or_default();
+            return Err(FactoryError::DatosInvalidos(format!(
+                "API Higgsfield devolvió HTTP {status}: {cuerpo}"
+            )));
+        }
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        let video_bytes = if content_type.contains("video/") || content_type.contains("octet-stream")
+        {
+            resp.bytes().await.map_err(|e| {
+                FactoryError::DatosInvalidos(format!(
+                    "error leyendo stream binario MP4 desde Higgsfield: {e}"
+                ))
+            })?
+            .to_vec()
+        } else {
+            let parsed: HiggsfieldApiResponse = resp.json().await.map_err(|e| {
+                FactoryError::DatosInvalidos(format!(
+                    "JSON inválido en respuesta de API Higgsfield: {e}"
+                ))
+            })?;
+            let url_descarga = parsed
+                .video_url
+                .or(parsed.download_url)
+                .filter(|u| !u.trim().is_empty())
+                .ok_or_else(|| {
+                    FactoryError::DatosInvalidos(
+                        "respuesta de API Higgsfield sin video_url ni download_url".to_string(),
+                    )
+                })?;
+
+            let dl = self
+                .http
+                .get(url_descarga.trim())
+                .send()
+                .await
+                .map_err(|e| {
+                    FactoryError::DatosInvalidos(format!(
+                        "error descargando clip MP4 desde Higgsfield: {e}"
+                    ))
+                })?;
+            if !dl.status().is_success() {
+                return Err(FactoryError::DatosInvalidos(format!(
+                    "descarga de clip Higgsfield devolvió HTTP {}",
+                    dl.status().as_u16()
+                )));
+            }
+            dl.bytes()
+                .await
+                .map_err(|e| {
+                    FactoryError::DatosInvalidos(format!(
+                        "error leyendo bytes de descarga Higgsfield: {e}"
+                    ))
+                })?
+                .to_vec()
+        };
+
+        validar_firma_mp4_mov(&video_bytes)?;
+
+        let (dir_raiz, clip) = {
+            let mut bib = biblioteca.lock().await;
+            let raiz = bib.directorio_raiz().to_path_buf();
+            let tmp_mp4 = raiz.join(format!(".incoming_higgsfield_{}.mp4", Uuid::new_v4()));
+            escribir_bytes_atomico(&tmp_mp4, &video_bytes)?;
+
+            let registro = bib.registrar_clip(SolicitudRegistroClipBroll {
+                ruta_origen: tmp_mp4.clone(),
+                vertical: brief_en_cola.vertical,
+                perfil_objetivo: Some(brief_en_cola.perfil_objetivo),
+                etiquetas: vec![
+                    "higgsfield_api".to_string(),
+                    brief_en_cola.movimiento_camara.clone(),
+                ],
+                duracion_ms: u64::from(brief_en_cola.duracion_objetivo_seg.max(4)) * 1_000,
+                ancho: 1080,
+                alto: 1920,
+                movimiento_camara: brief_en_cola.movimiento_camara.clone(),
+            });
+            let _ = fs::remove_file(&tmp_mp4);
+            let clip = registro?;
+            let _ = bib.marcar_brief_importado(brief_en_cola.id, clip.id)?;
+            (raiz, clip)
+        };
+
+        info!(
+            clip_id = %clip.id,
+            vertical = clip.vertical.etiqueta(),
+            broll_dir = %dir_raiz.display(),
+            "Clip B-Roll descargado vía API Higgsfield y registrado en BibliotecaBroll"
+        );
+
+        let mut brief_actualizado = brief_en_cola;
+        brief_actualizado.estado = EstadoBriefHiggsfield::Importado;
+        brief_actualizado.clip_asociado_id = Some(clip.id);
+
+        Ok(ResultadoGeneracionHiggsfield {
+            clip_registrado: Some(clip),
+            brief_encolado: brief_actualizado,
+            modo_real_api: true,
+            detalle: "Clip MP4 descargado desde API Higgsfield y sellado con SHA-256 en NVMe"
+                .to_string(),
+        })
+    }
 }

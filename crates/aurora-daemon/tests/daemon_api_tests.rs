@@ -5,15 +5,17 @@ use std::path::PathBuf;
 use aurora_council::{MiembroConsejo, ResultadoDelegacion, TipoTareaConsejo};
 use aurora_daemon::{
     crear_router, AprobarOrdenRequest, AprobarOrdenResponse, AuroraDaemonState,
-    BrollEstadoResponse, CouncilCuotasResponse, CrearOrdenForjaRequest, DelegarConsejoRequest,
-    DpoConsolidarResponse, ForgeOrdenesResponse, GatekeeperPendientesResponse,
-    GenerarBriefsHiggsfieldRequest, GenerarBriefsHiggsfieldResponse, HealthResponse, HuntRequest,
-    HuntResponse, OptOutRequest, OptOutResponse, OrdenPendienteDto, PublicarOrganicoRequest,
-    PublicarOrganicoResponse, PulseEstadoResponse, PulseOrganicoResponse, RechazarOrdenRequest,
-    RegistrarClipBrollRequest, TelaranaResponse,
+    BrollEstadoResponse, CatalogarProspectosRequest, CatalogarProspectosResponse,
+    CouncilCuotasResponse, CrearOrdenForjaRequest, DelegarConsejoRequest, DpoConsolidarResponse,
+    ForgeOrdenesResponse, GatekeeperPendientesResponse, GenerarBriefsHiggsfieldRequest,
+    GenerarBriefsHiggsfieldResponse, GenerarMonetizacionRequest, GenerarMonetizacionResponse,
+    HealthResponse, HuntRequest, HuntResponse, OptOutRequest, OptOutResponse, OrdenPendienteDto,
+    ProspectosDbResponse, PublicarOrganicoRequest, PublicarOrganicoResponse, PulseEstadoResponse,
+    PulseOrganicoResponse, RechazarOrdenRequest, RegistrarClipBrollRequest, TelaranaResponse,
 };
 use aurora_domain::{
-    EstadoAprobacion, PerfilPsicologico, SubverticalInmobiliaria, Ubicacion, VerticalComercial,
+    EstadoAprobacion, ObjetivoContenidoVideo, PerfilPsicologico, SubverticalInmobiliaria,
+    SubverticalSeguros, Ubicacion, VerticalComercial,
 };
 use aurora_factory::{sha256_bytes, ClipBroll, EstadoBriefHiggsfield};
 use aurora_forge::TipoOrdenIngenieria;
@@ -618,6 +620,7 @@ async fn portal_mobile_auth_bearer_y_publicacion_organica_http(
                 sha256_mp4: "0".repeat(64),
                 programado_para: None,
                 libre_de_pii: true,
+                objetivo: None,
             },
         })
         .send()
@@ -633,7 +636,7 @@ async fn portal_mobile_auth_bearer_y_publicacion_organica_http(
         .error_for_status()?
         .json()
         .await?;
-    assert_eq!(estado_org.publicadores.len(), 2);
+    assert_eq!(estado_org.publicadores.len(), 3);
     assert!(estado_org.publicaciones_realizadas.is_empty());
 
     let clip_mp4 = base_dir.join("reel_organico_carril_verde.mp4");
@@ -665,6 +668,7 @@ async fn portal_mobile_auth_bearer_y_publicacion_organica_http(
                 sha256_mp4: hash_mp4.clone(),
                 programado_para: None,
                 libre_de_pii: true,
+                objetivo: None,
             },
         })
         .send()
@@ -688,6 +692,229 @@ async fn portal_mobile_auth_bearer_y_publicacion_organica_http(
         .json()
         .await?;
     assert_eq!(estado_org_post.publicaciones_realizadas.len(), 1);
+
+    server_handle.abort();
+    let _ = fs::remove_dir_all(&base_dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn endpoints_http_prospectos_db_catalogacion_opt_out_monetizacion_y_tiktok(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base_dir = dir_temporal_daemon("aurora_fase15_db_tiktok");
+    let (base_url, server_handle) = levantar_servidor_efimero(&base_dir).await?;
+    let client = Client::new();
+
+    let hunt_seg: HuntResponse = client
+        .post(format!("{base_url}/api/v1/osint/hunt"))
+        .json(&HuntRequest {
+            vertical: VerticalComercial::Seguros(SubverticalSeguros::HombreClave),
+            ciudad: "Boca del Río".to_string(),
+            estado: "Veracruz".to_string(),
+            zona: Some("Costa de Oro".to_string()),
+            palabras_clave: vec!["hombre clave".to_string(), "expansión logística".to_string()],
+            limite_resultados: Some(3),
+            requiere_js: Some(false),
+            fuente_url: None,
+            fuente_formato: None,
+            registros_semilla: Some(vec![RegistroCrudo {
+                fuente_origen: "Boletín Empresarial Veracruz".to_string(),
+                url_evidencia: "https://ejemplo-publico.mx/veracruz/expansion-2026".to_string(),
+                capturado_en: Utc::now(),
+                formato: FormatoCrudo::TextoPlano,
+                contenido_crudo: "Lic. Valeria Montesinos Prado lidera expansión logística y sucesión patrimonial en Boca del Río con inversión de 40 MDP.".to_string(),
+                nombre_detectado: Some("Valeria Montesinos Prado".to_string()),
+                empresa_detectada: Some("Operadora Portuaria Montesinos S.A. de C.V.".to_string()),
+                ubicacion_detectada: Some(Ubicacion {
+                    ciudad: "Boca del Río".to_string(),
+                    estado: "Veracruz".to_string(),
+                    zona: Some("Costa de Oro".to_string()),
+                }),
+                co_mencionados: Vec::new(),
+                datos_extra: BTreeMap::new(),
+                opt_out_detectado: false,
+            }]),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(hunt_seg.prospectos_ingestados, 1);
+    let prospecto_seg_id = hunt_seg.planes_encolados[0].prospecto_id;
+
+    let hunt_inm: HuntResponse = client
+        .post(format!("{base_url}/api/v1/osint/hunt"))
+        .json(&HuntRequest {
+            vertical: VerticalComercial::Inmobiliaria(SubverticalInmobiliaria::ComercialIndustrial),
+            ciudad: "Monterrey".to_string(),
+            estado: "Nuevo León".to_string(),
+            zona: Some("Apodaca".to_string()),
+            palabras_clave: vec!["nave industrial".to_string()],
+            limite_resultados: Some(3),
+            requiere_js: Some(false),
+            fuente_url: None,
+            fuente_formato: None,
+            registros_semilla: Some(vec![RegistroCrudo {
+                fuente_origen: "Registro Industrial NL".to_string(),
+                url_evidencia: "https://ejemplo-publico.mx/nl/parque-apodaca".to_string(),
+                capturado_en: Utc::now(),
+                formato: FormatoCrudo::TextoPlano,
+                contenido_crudo: "Ing. Ernesto Salgado Garza amplía bodega industrial en Apodaca Nuevo León.".to_string(),
+                nombre_detectado: Some("Ernesto Salgado Garza".to_string()),
+                empresa_detectada: Some("Logística Regia S.A.".to_string()),
+                ubicacion_detectada: Some(Ubicacion {
+                    ciudad: "Monterrey".to_string(),
+                    estado: "Nuevo León".to_string(),
+                    zona: Some("Apodaca".to_string()),
+                }),
+                co_mencionados: Vec::new(),
+                datos_extra: BTreeMap::new(),
+                opt_out_detectado: false,
+            }]),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(hunt_inm.prospectos_ingestados, 1);
+
+    let db_completa: ProspectosDbResponse = client
+        .get(format!(
+            "{base_url}/api/v1/prospectos/db?orden=probabilidad_desc"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(db_completa.resumen.total, 2);
+    assert_eq!(db_completa.resumen.sin_evaluar, 0);
+    assert_eq!(db_completa.total_filtrado, 2);
+    let p0 = db_completa.prospectos[0]
+        .catalogacion
+        .as_ref()
+        .ok_or("se esperaba catalogación automática")?
+        .probabilidad_compra;
+    let p1 = db_completa.prospectos[1]
+        .catalogacion
+        .as_ref()
+        .ok_or("se esperaba catalogación automática")?
+        .probabilidad_compra;
+    assert!(p0 >= p1);
+
+    let db_seg: ProspectosDbResponse = client
+        .get(format!(
+            "{base_url}/api/v1/prospectos/db?sector=Seguros&q=Valeria"
+        ))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(db_seg.total_filtrado, 1);
+    assert_eq!(db_seg.prospectos[0].prospecto_id, prospecto_seg_id);
+
+    let cat_ind: CatalogarProspectosResponse = client
+        .post(format!("{base_url}/api/v1/prospectos/catalogar"))
+        .json(&CatalogarProspectosRequest {
+            prospecto_id: Some(prospecto_seg_id),
+            solo_sin_evaluar: None,
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(cat_ind.total_evaluados, 1);
+    assert_eq!(cat_ind.evaluados[0].prospecto_id, prospecto_seg_id);
+
+    let cat_lote: CatalogarProspectosResponse = client
+        .post(format!("{base_url}/api/v1/prospectos/catalogar"))
+        .json(&CatalogarProspectosRequest {
+            prospecto_id: None,
+            solo_sin_evaluar: Some(false),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(cat_lote.total_evaluados, 2);
+
+    let ruta_cat = base_dir.join("wal/catalogacion_compra.json");
+    assert!(ruta_cat.is_file());
+    let contenido_antes = fs::read_to_string(&ruta_cat)?;
+    assert!(contenido_antes.contains(&prospecto_seg_id.to_string()));
+
+    let opt_resp: OptOutResponse = client
+        .post(format!("{base_url}/api/v1/lfpdppp/opt-out"))
+        .json(&OptOutRequest {
+            prospecto_id: prospecto_seg_id,
+            campana_id: Some(hunt_seg.campana_id),
+            motivo: "Prueba Fase 15 purga DB y catalogación".to_string(),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(opt_resp.purgado_de_wal);
+
+    let contenido_despues = fs::read_to_string(&ruta_cat)?;
+    assert!(!contenido_despues.contains(&prospecto_seg_id.to_string()));
+
+    let db_post_optout: ProspectosDbResponse = client
+        .get(format!("{base_url}/api/v1/prospectos/db"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(db_post_optout.resumen.total, 1);
+
+    let resp_mon_pii = client
+        .post(format!("{base_url}/api/v1/content/generar-monetizacion"))
+        .json(&GenerarMonetizacionRequest {
+            vertical: VerticalComercial::Seguros(SubverticalSeguros::HombreClave),
+            plataforma: PlataformaPulso::TikTok,
+            objetivo: Some(ObjetivoContenidoVideo::MonetizacionAlcance),
+            tema_opcional: Some("Caso privado de Ernesto Salgado Garza".to_string()),
+            perfil_objetivo: None,
+            publicar_ahora: Some(true),
+            usar_higgsfield_api: Some(false),
+        })
+        .send()
+        .await?;
+    assert_eq!(resp_mon_pii.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let resp_mon_ok: GenerarMonetizacionResponse = client
+        .post(format!("{base_url}/api/v1/content/generar-monetizacion"))
+        .json(&GenerarMonetizacionRequest {
+            vertical: VerticalComercial::Seguros(SubverticalSeguros::HombreClave),
+            plataforma: PlataformaPulso::TikTok,
+            objetivo: Some(ObjetivoContenidoVideo::MonetizacionAlcance),
+            tema_opcional: Some("Deducibilidad fiscal para PyMEs en México".to_string()),
+            perfil_objetivo: Some(PerfilPsicologico::AnaliticoFinanciero),
+            publicar_ahora: Some(true),
+            usar_higgsfield_api: Some(true),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(resp_mon_ok.libre_de_pii_verificado);
+    assert!(resp_mon_ok.paquete.elegible_creator_rewards_tiktok);
+    assert!(resp_mon_ok.paquete.duracion_estimada_seg >= 61);
+    assert!(resp_mon_ok.publicado);
+    let comp_tt = resp_mon_ok
+        .comprobante_publicacion
+        .ok_or("se esperaba comprobante de publicación en TikTok")?;
+    assert_eq!(comp_tt.plataforma, PlataformaPulso::TikTok);
+    assert!(comp_tt.url_publica.starts_with("https://www.tiktok.com/"));
+    assert!(resp_mon_ok.resultado_higgsfield.is_some());
 
     server_handle.abort();
     let _ = fs::remove_dir_all(&base_dir);
