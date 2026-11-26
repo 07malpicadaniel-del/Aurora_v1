@@ -80,7 +80,7 @@ async fn cascada_completa_claude_agotado_codex_429_gemini_y_degradacion_bob_loca
             },
         )
         .con_politica(
-            MiembroConsejo::GeminiEstudiante,
+            MiembroConsejo::AntigravityGemini,
             PoliticaCuotaProveedor {
                 max_tareas_ventana_5h: 1,
                 max_tareas_diarias: 5,
@@ -103,7 +103,7 @@ async fn cascada_completa_claude_agotado_codex_429_gemini_y_degradacion_bob_loca
         "HTTP 429 Too Many Requests: 5-hour usage limit reached",
     ));
     let mock_gemini = Arc::new(DeterministicMockCouncilDriver::exito(
-        MiembroConsejo::GeminiEstudiante,
+        MiembroConsejo::AntigravityGemini,
         "Propuesta consultiva de alto ticket lista para revisión Gatekeeper.",
     ));
     let mock_opencode = Arc::new(DeterministicMockCouncilDriver::no_disponible(
@@ -130,13 +130,13 @@ async fn cascada_completa_claude_agotado_codex_429_gemini_y_degradacion_bob_loca
         })
         .await?;
 
-    assert_eq!(res1.miembro_respondedor, MiembroConsejo::GeminiEstudiante);
+    assert_eq!(res1.miembro_respondedor, MiembroConsejo::AntigravityGemini);
     assert!(res1.hubo_fallback);
     assert!(mock_claude.solicitudes_recibidas().is_empty());
     assert_eq!(mock_codex.solicitudes_recibidas().len(), 1);
     assert_eq!(mock_gemini.solicitudes_recibidas().len(), 1);
     assert!(!governor.puede_ejecutar(MiembroConsejo::CodexPlus).await);
-    assert!(!governor.puede_ejecutar(MiembroConsejo::GeminiEstudiante).await);
+    assert!(!governor.puede_ejecutar(MiembroConsejo::AntigravityGemini).await);
 
     // 2. Segunda delegación: Claude agotado, Codex en cooldown 429, Gemini agotado, OpenCode no disponible -> BOB Local.
     let res2 = orquestador
@@ -210,7 +210,7 @@ async fn persistencia_nvme_quota_governor_conserva_contadores_y_cooldowns(
         gov.registrar_uso(MiembroConsejo::ClaudePro).await?;
         gov.registrar_rate_limit(MiembroConsejo::CodexPlus, "HTTP 429 test")
             .await?;
-        gov.registrar_uso(MiembroConsejo::GeminiEstudiante).await?;
+        gov.registrar_uso(MiembroConsejo::AntigravityGemini).await?;
     }
 
     assert!(ruta_cuotas.is_file());
@@ -224,7 +224,7 @@ async fn persistencia_nvme_quota_governor_conserva_contadores_y_cooldowns(
         .estado_miembro(MiembroConsejo::CodexPlus)
         .await;
     let estado_gemini = gov_recargado
-        .estado_miembro(MiembroConsejo::GeminiEstudiante)
+        .estado_miembro(MiembroConsejo::AntigravityGemini)
         .await;
 
     assert_eq!(estado_claude.usado_ventana_5h, 2);
@@ -241,7 +241,7 @@ async fn persistencia_nvme_quota_governor_conserva_contadores_y_cooldowns(
     assert_eq!(
         cascada,
         vec![
-            MiembroConsejo::GeminiEstudiante,
+            MiembroConsejo::AntigravityGemini,
             MiembroConsejo::OpenCodeLocal,
             MiembroConsejo::BobLocal,
         ]

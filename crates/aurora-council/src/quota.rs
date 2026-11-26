@@ -2,10 +2,11 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -15,7 +16,7 @@ use crate::error::{CouncilError, CouncilResult};
 pub const ORDEN_CASCADA_CONSEJO: [MiembroConsejo; 5] = [
     MiembroConsejo::ClaudePro,
     MiembroConsejo::CodexPlus,
-    MiembroConsejo::GeminiEstudiante,
+    MiembroConsejo::AntigravityGemini,
     MiembroConsejo::OpenCodeLocal,
     MiembroConsejo::BobLocal,
 ];
@@ -33,8 +34,9 @@ pub enum MiembroConsejo {
     ClaudePro,
     /// Suscripción ChatGPT Plus / Codex vía CLI headless (`codex exec`).
     CodexPlus,
-    /// Cuenta Gemini Estudiante vía CLI headless (`gemini -p`).
-    GeminiEstudiante,
+    /// Suscripción Antigravity / Gemini vía CLI headless (`antigravity` o `gemini -p`).
+    #[serde(alias = "GeminiEstudiante")]
+    AntigravityGemini,
     /// Orquestador CLI local (`opencode run`).
     OpenCodeLocal,
     /// Respaldo soberano local en VRAM RTX 5060 Ti (`slot_id = 0`, nunca se agota).
@@ -48,7 +50,7 @@ impl MiembroConsejo {
         match self {
             Self::ClaudePro => "claude_pro",
             Self::CodexPlus => "codex_plus",
-            Self::GeminiEstudiante => "gemini_estudiante",
+            Self::AntigravityGemini => "antigravity_gemini",
             Self::OpenCodeLocal => "opencode_local",
             Self::BobLocal => "bob_local",
         }
@@ -59,7 +61,7 @@ impl MiembroConsejo {
     pub const fn es_externo_nube(&self) -> bool {
         matches!(
             self,
-            Self::ClaudePro | Self::CodexPlus | Self::GeminiEstudiante
+            Self::ClaudePro | Self::CodexPlus | Self::AntigravityGemini
         )
     }
 
@@ -104,7 +106,7 @@ impl PoliticaCuotaProveedor {
                 cooldown_rate_limit_segundos: 1_800,
                 ilimitado: false,
             },
-            MiembroConsejo::GeminiEstudiante => Self {
+            MiembroConsejo::AntigravityGemini => Self {
                 max_tareas_ventana_5h: 25,
                 max_tareas_diarias: 100,
                 cooldown_rate_limit_segundos: 900,
@@ -199,21 +201,24 @@ struct LibroCuotasPersistido {
     actualizado_en: Option<DateTime<Utc>>,
 }
 
-/// Gobernador thread-safe de cuotas móviles de 5 horas, topes diarios y cooldowns en NVMe.
+/// Gobernador thread-safe de cuotas móviles de 5 horas, topes diarios, semáforo=1 por proveedor y cooldowns en NVMe.
 pub struct QuotaGovernor {
     ruta_persistencia: PathBuf,
     politicas: BTreeMap<MiembroConsejo, PoliticaCuotaProveedor>,
+    semaforos: BTreeMap<MiembroConsejo, Arc<Semaphore>>,
     libro: Mutex<LibroCuotasPersistido>,
 }
 
 impl QuotaGovernor {
     /// Abre o inicializa el gobernador de cuotas desde disco NVMe.
     pub fn abrir(mut config: ConfigCuotasConsejo) -> CouncilResult<Self> {
+        let mut semaforos = BTreeMap::new();
         for miembro in ORDEN_CASCADA_CONSEJO {
             config
                 .politicas
                 .entry(miembro)
                 .or_insert_with(|| PoliticaCuotaProveedor::por_defecto_para(miembro));
+            semaforos.insert(miembro, Arc::new(Semaphore::new(1)));
         }
         if let Some(pol_bob) = config.politicas.get_mut(&MiembroConsejo::BobLocal) {
             pol_bob.ilimitado = true;
@@ -242,8 +247,18 @@ impl QuotaGovernor {
         Ok(Self {
             ruta_persistencia: config.ruta_persistencia,
             politicas: config.politicas,
+            semaforos,
             libro: Mutex::new(libro),
         })
+    }
+
+    /// Devuelve el semáforo de 1 permiso asociado al proveedor para evitar ráfagas sobre la misma suscripción.
+    #[must_use]
+    pub fn semaforo_miembro(&self, miembro: MiembroConsejo) -> Arc<Semaphore> {
+        self.semaforos
+            .get(&miembro)
+            .map(Arc::clone)
+            .unwrap_or_else(|| Arc::new(Semaphore::new(1)))
     }
 
     /// Devuelve la ruta NVMe donde se persiste el libro de uso.

@@ -1,14 +1,21 @@
+pub mod context_sandbox;
 pub mod drivers;
 pub mod error;
 pub mod quota;
 pub mod router;
 pub mod sanitizer;
+pub mod subdirector;
 
+pub use context_sandbox::{
+    ConfigContextoAislado, ContextPackager, ContextPrivacyAudit, EntornoMisionAislado,
+    ReporteAuditoriaPrivacidad, EXTENSIONES_PROHIBIDAS, LISTA_NEGRA_ARCHIVOS_PROHIBIDOS,
+};
 pub use drivers::{
     binario_disponible, detectar_rate_limit_en_salida, gbnf_respuesta_consejo_bob,
-    BobLocalFallbackDriver, ClaudeCodeCliDriver, CodexCliDriver, CouncilAgentDriver,
-    DeterministicMockCouncilDriver, GeminiCliDriver, ModoMockDriver, OpenCodeCliDriver,
-    RespuestaConsejo, SolicitudConsejo, DEFAULT_COUNCIL_CLI_TIMEOUT_MS,
+    resolver_ruta_binario, AntigravityGeminiCliDriver, BobLocalFallbackDriver,
+    ClaudeCodeCliDriver, CodexCliDriver, CouncilAgentDriver, DeterministicMockCouncilDriver,
+    DiagnosticoSesionAgente, GeminiCliDriver, ModoMockDriver, OpenCodeCliDriver, RespuestaConsejo,
+    SolicitudConsejo, DEFAULT_COUNCIL_CLI_TIMEOUT_MS, VARS_SECRETAS_AURORA,
 };
 pub use error::{CouncilError, CouncilResult};
 pub use quota::{
@@ -20,3 +27,8 @@ pub use router::{
     TipoTareaConsejo,
 };
 pub use sanitizer::{MapaSanitizacionPii, PiiFirewall};
+pub use subdirector::{
+    AsignacionSubtarea, EstadoSubtarea, ForgeCodeDelegate, ReporteMisionProyecto,
+    ResultadoDelegacionForja, ResultadoSubtarea, RolEspecialista, SolicitudMisionProyecto,
+    SubdirectorProyectosBob,
+};

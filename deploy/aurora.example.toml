@@ -52,6 +52,8 @@ usar_nvenc = true
 # Biblioteca local en NVMe de clips maestros B-Roll (Higgsfield) sin texto ni voz + cola de briefs
 # Override por entorno: AURORA_BROLL_DIR
 broll_dir = "~/.local/share/aurora/assets/broll"
+# Puente opcional API Higgsfield (por defecto opera en modo cola manual sin pago; inyectar vía AURORA_HIGGSFIELD_API_KEY en secrets.env):
+# higgsfield_api_url = "https://api.higgsfield.ai/v1/generations"
 
 [smtp]
 # Activa el transporte real tokio1-rustls-tls tras aprobación Gatekeeper y correo destino
@@ -70,11 +72,16 @@ adjuntar_reel_si_menor_a_mb = 12
 timeout_ms = 15000
 
 [council]
-# Binarios CLI headless del Consejo Multi-Agente (cascada Claude -> Codex -> Gemini -> OpenCode -> BOB Local)
+# Binarios CLI headless del Consejo Multi-Agente y Subdirector Paralelo
+# (Claude Code, Codex, Antigravity/Gemini, OpenCode y BOB Local)
 claude_bin = "claude"
 codex_bin = "codex"
+antigravity_bin = "antigravity"
 gemini_bin = "gemini"
 opencode_bin = "opencode"
+# Entorno efímero aislado por misión (lista blanca sin PII ni secretos) y raíz de documentación del proyecto
+sandbox_dir = "~/.local/share/aurora/sandboxes"
+# proyecto_root = "/home/daniel/.gemini/antigravity-ide/scratch/Aurora_v1"
 # Presupuestos conservadores de ventana móvil de 5 horas y tope diario para proteger suscripciones Pro/Plus
 claude_max_5h = 10
 claude_max_diario = 30
@@ -116,9 +123,3 @@ organico_intervalo_minutos = 120
 # Publicación orgánica oficial (inyectar vía ~/.config/aurora/secrets.env):
 # AURORA_YOUTUBE_ACCESS_TOKEN, AURORA_META_IG_USER_ID, AURORA_META_ACCESS_TOKEN, AURORA_META_MEDIA_BASE_URL,
 # AURORA_TIKTOK_ACCESS_TOKEN, AURORA_TIKTOK_MODE ("inbox" | "direct_post")
-
-[factory]
-# Directorio NVMe de la biblioteca B-Roll e índice Higgsfield (<data_dir>/assets/broll si se omite)
-broll_dir = "~/.local/share/aurora/assets/broll"
-# Puente opcional API Higgsfield (inyectar preferentemente vía AURORA_HIGGSFIELD_API_KEY en secrets.env):
-# higgsfield_api_url = "https://api.higgsfield.ai/v1/generations"

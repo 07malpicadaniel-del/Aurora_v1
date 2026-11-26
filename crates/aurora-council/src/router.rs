@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::drivers::{
-    CouncilAgentDriver, SolicitudConsejo, DEFAULT_COUNCIL_CLI_TIMEOUT_MS,
+    CouncilAgentDriver, DiagnosticoSesionAgente, SolicitudConsejo, DEFAULT_COUNCIL_CLI_TIMEOUT_MS,
 };
 use crate::error::{CouncilError, CouncilResult};
 use crate::quota::{EstadoCuotaMiembro, MiembroConsejo, QuotaGovernor, ORDEN_CASCADA_CONSEJO};
@@ -164,6 +164,30 @@ impl OrquestadorConsejo {
         Arc::clone(&self.governor)
     }
 
+    /// Devuelve el driver registrado para `miembro` si existe.
+    #[must_use]
+    pub fn driver(&self, miembro: MiembroConsejo) -> Option<Arc<dyn CouncilAgentDriver>> {
+        self.drivers.get(&miembro).map(Arc::clone)
+    }
+
+    /// Devuelve el diagnóstico no intrusivo de disponibilidad y sesión de cada miembro del consejo.
+    #[must_use]
+    pub fn diagnosticos_agentes(&self) -> Vec<DiagnosticoSesionAgente> {
+        ORDEN_CASCADA_CONSEJO
+            .iter()
+            .map(|miembro| match self.drivers.get(miembro) {
+                Some(driver) => driver.verificar_disponibilidad_y_sesion(),
+                None => DiagnosticoSesionAgente {
+                    miembro: *miembro,
+                    binario_encontrado: false,
+                    ruta_binario: None,
+                    sesion_local_detectada: false,
+                    detalle: "Driver no registrado en el orquestador".to_string(),
+                },
+            })
+            .collect()
+    }
+
     /// Evalúa si una petición amerita escalamiento al consejo externo o ejecución directa en BOB.
     #[must_use]
     pub fn debe_escalar_a_consejo(&self, peticion: &PeticionDelegacion) -> bool {
@@ -278,6 +302,14 @@ impl OrquestadorConsejo {
                     directorio_trabajo: peticion.directorio_trabajo.clone(),
                     timeout_ms,
                 };
+
+                let semaforo = self.governor.semaforo_miembro(miembro);
+                let _permiso_proveedor = semaforo.acquire_owned().await.map_err(|_| {
+                    CouncilError::SalidaInvalida {
+                        miembro: miembro.etiqueta().to_string(),
+                        detalle: "semáforo de protección de proveedor cerrado".to_string(),
+                    }
+                })?;
 
                 match driver.ejecutar(&solicitud).await {
                     Ok(resp) => {

@@ -12,9 +12,12 @@ use aurora_cortex::{
     RolCognitivo, TipoInteraccionPeriferica, ToolDispatcher,
 };
 use aurora_council::{
-    BobLocalFallbackDriver, ClaudeCodeCliDriver, CodexCliDriver, DeterministicMockCouncilDriver,
-    EstadoCuotaMiembro, GeminiCliDriver, MiembroConsejo, OpenCodeCliDriver, OrquestadorConsejo,
-    PeticionDelegacion, PiiFirewall, QuotaGovernor, ResultadoDelegacion, TipoTareaConsejo,
+    AntigravityGeminiCliDriver, BobLocalFallbackDriver, ClaudeCodeCliDriver, CodexCliDriver,
+    ConfigContextoAislado, CouncilError, CouncilResult, DeterministicMockCouncilDriver,
+    EstadoCuotaMiembro, ForgeCodeDelegate, MiembroConsejo, OpenCodeCliDriver, OrquestadorConsejo,
+    PeticionDelegacion, PiiFirewall, QuotaGovernor, ReporteMisionProyecto, ResultadoDelegacion,
+    ResultadoDelegacionForja, RolEspecialista, SolicitudMisionProyecto, SubdirectorProyectosBob,
+    TipoTareaConsejo,
 };
 use aurora_domain::{
     validar_catalogacion_compra, validar_prospecto, CatalogacionCompraBob, EstadoAprobacion,
@@ -908,6 +911,143 @@ pub struct PublicarOrganicoResponse {
     pub programado_para: Option<DateTime<Utc>>,
 }
 
+/// Estado operativo de un agente especialista del Subdirector Multi-IA (`GET /api/v1/subdirector/agentes`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgenteSubdirectorDto {
+    /// Identificador canónico del miembro del consejo.
+    pub miembro: MiembroConsejo,
+    /// Etiqueta estable en español/técnica para UI.
+    pub etiqueta: String,
+    /// Especialidad principal asignada por defecto por BOB.
+    pub especialidad_por_defecto: String,
+    /// Rol especialista principal asociado (si aplica).
+    pub rol_por_defecto: Option<RolEspecialista>,
+    /// `true` si el binario CLI o backend local está disponible en la estación.
+    pub binario_detectado: bool,
+    /// `true` si se detectaron indicadores locales no intrusivos de sesión/configuración.
+    pub sesion_detectada: bool,
+    /// `true` si está disponible ahora (binario listo y cuota vigente).
+    pub disponible: bool,
+    /// Ruta del binario detectado o endpoint local.
+    pub ruta_binario: Option<String>,
+    /// Diagnóstico textual legible sin secretos.
+    pub detalle_sesion: String,
+    /// Estado vigente de cuota (ventana 5h, tope diario y cooldown 429).
+    pub cuota: EstadoCuotaMiembro,
+}
+
+/// Respuesta de `GET /api/v1/subdirector/agentes`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubdirectorAgentesResponse {
+    /// Lista ordenada de agentes del Subdirector (Claude, Codex, Antigravity/Gemini, OpenCode, BOB Local).
+    pub agentes: Vec<AgenteSubdirectorDto>,
+    /// Modo operativo explícito de Higgsfield (`"cola_manual_sin_pago"` por defecto).
+    pub higgsfield_modo: String,
+    /// `true` únicamente cuando existe clave API pagada de Higgsfield configurada.
+    pub higgsfield_pagado: bool,
+    /// Directorio base donde se crean y limpian los sandboxes efímeros `mission-<uuid>/`.
+    pub sandbox_dir: PathBuf,
+    /// Raíz del proyecto usada para la lista blanca de contexto.
+    pub proyecto_root: PathBuf,
+    /// Cantidad de agentes actualmente listos para ejecución paralela.
+    pub total_disponibles: usize,
+}
+
+/// Respuesta de `GET /api/v1/subdirector/misiones`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubdirectorMisionesResponse {
+    /// Total de misiones registradas en historial sanitizado.
+    pub total: usize,
+    /// Modo operativo vigente de Higgsfield.
+    pub higgsfield_modo: String,
+    /// Historial reciente (más reciente primero), 100 % libre de PII y secretos.
+    pub misiones: Vec<ReporteMisionProyecto>,
+}
+
+struct DaemonForgeDelegate {
+    habilitado: bool,
+    repo_root: PathBuf,
+    worktrees_dir: PathBuf,
+    timeout_segundos: u64,
+    council_timeout_ms: u64,
+    consejo: Arc<OrquestadorConsejo>,
+    forge_ordenes: Arc<Mutex<Vec<RegistroOrdenForjaDto>>>,
+    ruta_forge_persistida: Option<PathBuf>,
+}
+
+#[async_trait]
+impl ForgeCodeDelegate for DaemonForgeDelegate {
+    async fn ejecutar_track_codigo(
+        &self,
+        mision_id: Uuid,
+        consigna_sanitizada: &str,
+    ) -> CouncilResult<ResultadoDelegacionForja> {
+        if !self.habilitado {
+            return Err(CouncilError::CliNoDisponible {
+                miembro: "aurora_forge".to_string(),
+                detalle: "aurora-forge está deshabilitado en configuración".to_string(),
+            });
+        }
+
+        let rutas_permitidas = vec![
+            "crates/aurora-osint/src".to_string(),
+            "crates/aurora-factory/src".to_string(),
+        ];
+        validar_rutas_permitidas(&rutas_permitidas).map_err(|e| CouncilError::SalidaInvalida {
+            miembro: "aurora_forge".to_string(),
+            detalle: e.to_string(),
+        })?;
+
+        let mut orden = OrdenIngenieria::nueva(
+            TipoOrdenIngenieria::SelfHealingScraper,
+            format!("[Misión {mision_id}] {consigna_sanitizada}"),
+            rutas_permitidas,
+            ComandoValidacion::CargoCheckClippyTest,
+        );
+
+        let sandbox = WorktreeSandbox::new(ConfigSandboxForja {
+            repo_root: self.repo_root.clone(),
+            worktrees_dir: self.worktrees_dir.clone(),
+            timeout_segundos: self.timeout_segundos,
+        });
+        let executor = CouncilForgeExecutor::new(Arc::clone(&self.consejo), self.council_timeout_ms);
+
+        match sandbox.ejecutar_orden(&mut orden, &executor).await {
+            Ok(reporte) => {
+                let rama = reporte.rama_forge.clone();
+                let resumen = format!(
+                    "Sandbox aurora-forge completado en rama '{rama}' (estado={:?}, archivos={:?}). Pendiente de revisión humana.",
+                    orden.estado, reporte.archivos_modificados
+                );
+                let dto = RegistroOrdenForjaDto {
+                    orden,
+                    reporte: Some(reporte),
+                    error: None,
+                    actualizado_en: Utc::now(),
+                };
+                {
+                    let mut guard = self.forge_ordenes.lock();
+                    guard.insert(0, dto);
+                    if guard.len() > 100 {
+                        guard.truncate(100);
+                    }
+                    if let Some(ref ruta) = self.ruta_forge_persistida {
+                        let _ = persistir_ordenes_forge(ruta, &guard);
+                    }
+                }
+                Ok(ResultadoDelegacionForja {
+                    rama_forge: Some(rama),
+                    resumen,
+                })
+            }
+            Err(err) => Err(CouncilError::SalidaInvalida {
+                miembro: "aurora_forge".to_string(),
+                detalle: err.to_string(),
+            }),
+        }
+    }
+}
+
 /// Evento emitido en tiempo real hacia `/api/v1/eventos/stream`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventoDaemon {
@@ -975,16 +1115,19 @@ pub struct AuroraDaemonState {
     telemetria: Arc<RecolectorTelemetria>,
     motor_dpo: MotorConsolidacionNocturna<DynBobBackend>,
     consejo: Arc<OrquestadorConsejo>,
+    subdirector: Arc<SubdirectorProyectosBob>,
     scheduler_estado: Mutex<EstadoSchedulerDpo>,
     cola_gatekeeper: Mutex<BTreeMap<Uuid, RegistroOrdenInterno>>,
     cola_organica: Mutex<Vec<PublicacionOrganicaProgramada>>,
     catalogaciones: Mutex<HashMap<Uuid, CatalogacionCompraBob>>,
-    forge_ordenes: Mutex<Vec<RegistroOrdenForjaDto>>,
+    forge_ordenes: Arc<Mutex<Vec<RegistroOrdenForjaDto>>>,
+    misiones_subdirector: Mutex<Vec<ReporteMisionProyecto>>,
     calentamientos_recientes: Mutex<Vec<RegistroInteraccion>>,
     despachos_recientes: Mutex<Vec<ComprobanteDespacho>>,
     ruta_cola_persistida: Option<PathBuf>,
     ruta_forge_persistida: Option<PathBuf>,
     ruta_catalogacion_persistida: Option<PathBuf>,
+    ruta_misiones_persistida: Option<PathBuf>,
     eventos_tx: broadcast::Sender<EventoDaemon>,
 }
 
@@ -1213,13 +1356,15 @@ impl AuroraDaemonState {
             consejo_builder = consejo_builder
                 .con_driver(Arc::new(DeterministicMockCouncilDriver::exito(
                     MiembroConsejo::ClaudePro,
-                    "[Consejo Offline] Propuesta generada para: {prompt}",
+                    "[Consejo Offline · Claude] Propuesta generada para: {prompt}",
                 )))
-                .con_driver(Arc::new(DeterministicMockCouncilDriver::no_disponible(
+                .con_driver(Arc::new(DeterministicMockCouncilDriver::exito(
                     MiembroConsejo::CodexPlus,
+                    "[Consejo Offline · Codex] Especificación técnica Rust sin unwrap/expect lista.",
                 )))
-                .con_driver(Arc::new(DeterministicMockCouncilDriver::no_disponible(
-                    MiembroConsejo::GeminiEstudiante,
+                .con_driver(Arc::new(DeterministicMockCouncilDriver::exito(
+                    MiembroConsejo::AntigravityGemini,
+                    "[Consejo Offline · Antigravity/Gemini] Manifiesto de escenas 9:16 (modo cola manual Higgsfield + NVENC local).",
                 )))
                 .con_driver(Arc::new(DeterministicMockCouncilDriver::no_disponible(
                     MiembroConsejo::OpenCodeLocal,
@@ -1234,7 +1379,8 @@ impl AuroraDaemonState {
                     expandir_tilde_path(&config.council.codex_bin),
                     config.council.timeout_ms,
                 )))
-                .con_driver(Arc::new(GeminiCliDriver::new(
+                .con_driver(Arc::new(AntigravityGeminiCliDriver::con_respaldo(
+                    expandir_tilde_path(&config.council.antigravity_bin),
                     expandir_tilde_path(&config.council.gemini_bin),
                     config.council.timeout_ms,
                 )))
@@ -1243,6 +1389,7 @@ impl AuroraDaemonState {
                     config.council.timeout_ms,
                 )));
         }
+        let bob_para_subdirector = Arc::clone(&bob_backend);
         let consejo = Arc::new(
             consejo_builder.con_driver(Arc::new(
                 BobLocalFallbackDriver::new(DynBobBackend(bob_backend))
@@ -1256,15 +1403,49 @@ impl AuroraDaemonState {
         } else {
             Vec::new()
         };
+        let forge_ordenes = Arc::new(Mutex::new(forge_inicial));
+
+        let forge_delegate = Arc::new(DaemonForgeDelegate {
+            habilitado: config.forge.habilitado,
+            repo_root: config.forge_repo_root_efectivo(),
+            worktrees_dir: config.forge_worktrees_dir_efectivo(),
+            timeout_segundos: config.forge.timeout_segundos,
+            council_timeout_ms: config.council.timeout_ms,
+            consejo: Arc::clone(&consejo),
+            forge_ordenes: Arc::clone(&forge_ordenes),
+            ruta_forge_persistida: ruta_forge_persistida.clone(),
+        });
+
+        let subdirector = Arc::new(
+            SubdirectorProyectosBob::new(
+                Arc::clone(&consejo),
+                ConfigContextoAislado::por_defecto(
+                    config.proyecto_root_efectivo(),
+                    config.sandbox_dir_efectivo(),
+                ),
+            )
+            .con_bob_planificador(bob_para_subdirector, Arc::clone(&bob_slot_lock))
+            .con_forge_delegate(forge_delegate),
+        );
+
+        let ruta_misiones_persistida = Some(config.misiones_subdirector_path_efectivo());
+        let misiones_inicial = if let Some(ref ruta) = ruta_misiones_persistida {
+            cargar_misiones_subdirector(ruta)?
+        } else {
+            Vec::new()
+        };
+
         let broll = Arc::new(tokio::sync::Mutex::new(BibliotecaBroll::abrir(
             config.broll_dir_efectivo(),
         )?));
-        let higgsfield: Arc<dyn HiggsfieldProvider> = match config.modo_efectivo() {
-            ModoEjecucion::SimuladoOffline => Arc::new(ManualQueueHiggsfieldClient),
-            ModoEjecucion::EstrictoReal | ModoEjecucion::RealConFallback => {
+        let higgsfield: Arc<dyn HiggsfieldProvider> =
+            if matches!(config.modo_efectivo(), ModoEjecucion::SimuladoOffline)
+                || !config.higgsfield_pagado()
+            {
+                Arc::new(ManualQueueHiggsfieldClient)
+            } else {
                 Arc::new(ApiHiggsfieldClient::new(config.config_higgsfield())?)
-            }
-        };
+            };
         let fabrica = FabricaMultimodalAurora::new(
             ConfigFabrica {
                 directorio_base: factory_dir,
@@ -1389,16 +1570,19 @@ impl AuroraDaemonState {
             telemetria: Arc::new(RecolectorTelemetria::new()),
             motor_dpo,
             consejo,
+            subdirector,
             scheduler_estado: Mutex::new(scheduler_inicial),
             cola_gatekeeper: Mutex::new(cola_inicial),
             cola_organica: Mutex::new(Vec::new()),
             catalogaciones: Mutex::new(catalogaciones_inicial),
-            forge_ordenes: Mutex::new(forge_inicial),
+            forge_ordenes,
+            misiones_subdirector: Mutex::new(misiones_inicial),
             calentamientos_recientes: Mutex::new(Vec::new()),
             despachos_recientes: Mutex::new(Vec::new()),
             ruta_cola_persistida,
             ruta_forge_persistida,
             ruta_catalogacion_persistida,
+            ruta_misiones_persistida,
             eventos_tx,
         }))
     }
@@ -1525,6 +1709,10 @@ impl AuroraDaemonState {
         if let Some(ref ruta) = self.ruta_catalogacion_persistida {
             let cats = self.catalogaciones.lock();
             persistir_catalogaciones(ruta, &cats)?;
+        }
+        if let Some(ref ruta) = self.ruta_misiones_persistida {
+            let misiones = self.misiones_subdirector.lock();
+            persistir_misiones_subdirector(ruta, &misiones)?;
         }
         info!("WAL 4D compactado y colas persistidas en apagado ordenado");
         Ok(())
@@ -2379,6 +2567,174 @@ impl AuroraDaemonState {
         );
 
         Ok(resultado)
+    }
+
+    /// Devuelve disponibilidad real, sesión local, cuotas y especialidad de los 5 agentes del Subdirector.
+    pub async fn obtener_agentes_subdirector(&self) -> SubdirectorAgentesResponse {
+        let diagnosticos = self.subdirector.diagnosticos_agentes();
+        let cuotas = self.consejo.governor().estado_todas_las_cuotas().await;
+        let cuotas_map: HashMap<MiembroConsejo, EstadoCuotaMiembro> = cuotas
+            .into_iter()
+            .map(|c| (c.miembro, c))
+            .collect();
+
+        let orden = [
+            MiembroConsejo::ClaudePro,
+            MiembroConsejo::CodexPlus,
+            MiembroConsejo::AntigravityGemini,
+            MiembroConsejo::OpenCodeLocal,
+            MiembroConsejo::BobLocal,
+        ];
+
+        let mut agentes = Vec::with_capacity(orden.len());
+        for miembro in orden {
+            let diag = diagnosticos.iter().find(|d| d.miembro == miembro);
+            let cuota = cuotas_map.get(&miembro).cloned().unwrap_or(EstadoCuotaMiembro {
+                miembro,
+                usado_ventana_5h: 0,
+                limite_ventana_5h: 0,
+                usado_diario: 0,
+                limite_diario: 0,
+                ilimitado: matches!(miembro, MiembroConsejo::BobLocal),
+                disponible: matches!(miembro, MiembroConsejo::BobLocal),
+                cooldown_hasta: None,
+                motivo_bloqueo: None,
+            });
+
+            let (etiqueta, especialidad, rol_por_defecto) = match miembro {
+                MiembroConsejo::ClaudePro => (
+                    "Claude Code",
+                    "Guiones y Copy",
+                    Some(RolEspecialista::GuionesYCopy),
+                ),
+                MiembroConsejo::CodexPlus => (
+                    "Codex",
+                    "Conectores / Código",
+                    Some(RolEspecialista::IngenieriaYConectores),
+                ),
+                MiembroConsejo::AntigravityGemini => (
+                    "Antigravity / Gemini",
+                    "Video / Contexto",
+                    Some(RolEspecialista::DireccionVideoYContexto),
+                ),
+                MiembroConsejo::OpenCodeLocal => ("OpenCode Local", "Respaldo CLI Local", None),
+                MiembroConsejo::BobLocal => (
+                    "BOB Local",
+                    "Director / Datos Locales",
+                    Some(RolEspecialista::EstrategiaYAuditoria),
+                ),
+            };
+
+            let binario_detectado = diag.is_some_and(|d| d.binario_encontrado);
+            let sesion_detectada = diag.is_some_and(|d| d.sesion_local_detectada);
+            let disponible = binario_detectado && cuota.disponible;
+
+            agentes.push(AgenteSubdirectorDto {
+                miembro,
+                etiqueta: etiqueta.to_string(),
+                especialidad_por_defecto: especialidad.to_string(),
+                rol_por_defecto,
+                binario_detectado,
+                sesion_detectada,
+                disponible,
+                ruta_binario: diag
+                    .and_then(|d| d.ruta_binario.as_ref().map(|p| p.display().to_string())),
+                detalle_sesion: diag
+                    .map(|d| d.detalle.clone())
+                    .unwrap_or_else(|| "Agente no registrado".to_string()),
+                cuota,
+            });
+        }
+
+        let total_disponibles = agentes.iter().filter(|a| a.disponible).count();
+
+        SubdirectorAgentesResponse {
+            agentes,
+            higgsfield_modo: self.config.higgsfield_modo().to_string(),
+            higgsfield_pagado: self.config.higgsfield_pagado(),
+            sandbox_dir: self.config.sandbox_dir_efectivo(),
+            proyecto_root: self.config.proyecto_root_efectivo(),
+            total_disponibles,
+        }
+    }
+
+    /// Lista el historial sanitizado de misiones del Subdirector Multi-IA (sin PII ni secretos).
+    pub fn listar_misiones_subdirector(&self) -> SubdirectorMisionesResponse {
+        let misiones = self.misiones_subdirector.lock().clone();
+        SubdirectorMisionesResponse {
+            total: misiones.len(),
+            higgsfield_modo: self.config.higgsfield_modo().to_string(),
+            misiones,
+        }
+    }
+
+    /// Lanza una nueva misión paralela orquestada por BOB sobre contexto aislado cero-fugas.
+    #[tracing::instrument(skip(self, req), fields(titulo = %req.titulo))]
+    pub async fn lanzar_mision_subdirector(
+        &self,
+        mut req: SolicitudMisionProyecto,
+    ) -> DaemonResult<ReporteMisionProyecto> {
+        // Higgsfield mantiene modo cola manual sin pago mientras no exista API key configurada.
+        if !self.config.higgsfield_pagado() {
+            req.higgsfield_pagado = false;
+        }
+
+        let (prospectos_referenciados, prospectos_activos) = {
+            let mem = self.memoria.read().await;
+            let mut referenciados = Vec::with_capacity(req.prospecto_ids.len());
+            for pid in &req.prospecto_ids {
+                if mem.esta_en_blacklist(*pid) {
+                    return Err(DaemonError::OptOutActivo(*pid));
+                }
+                let reg = mem
+                    .grafo()
+                    .obtener_por_uuid(*pid)
+                    .ok_or(DaemonError::ProspectoNoEncontrado(*pid))?;
+                if reg.prospecto.lfpdppp.opt_out {
+                    return Err(DaemonError::OptOutActivo(*pid));
+                }
+                referenciados.push(reg.prospecto.clone());
+            }
+            let activos: Vec<Prospecto> = mem
+                .grafo()
+                .iter_nodos()
+                .map(|r| r.prospecto.clone())
+                .collect();
+            (referenciados, activos)
+        };
+
+        let reporte = self
+            .subdirector
+            .ejecutar_mision(req, &prospectos_referenciados, &prospectos_activos)
+            .await?;
+
+        // Persistimos únicamente una copia 100 % sanitizada en <wal_dir>/misiones_subdirector.json.
+        let reporte_nvme = sanitizar_reporte_mision_para_nvme(&reporte, &prospectos_activos);
+        {
+            let mut misiones = self.misiones_subdirector.lock();
+            misiones.insert(0, reporte_nvme);
+            if misiones.len() > 50 {
+                misiones.truncate(50);
+            }
+            if let Some(ref ruta) = self.ruta_misiones_persistida {
+                persistir_misiones_subdirector(ruta, &misiones)?;
+            }
+        }
+
+        self.emitir_evento(
+            "MisionSubdirectorCompletada",
+            serde_json::json!({
+                "mision_id": reporte.mision_id,
+                "titulo": reporte.titulo,
+                "tracks": reporte.subtareas.len(),
+                "latencia_total_ms": reporte.latencia_total_ms,
+                "libre_de_fugas": reporte.auditoria_privacidad.libre_de_fugas,
+                "sandbox_limpiado": reporte.sandbox_limpiado,
+                "higgsfield_modo": reporte.higgsfield_modo,
+            }),
+        );
+
+        Ok(reporte)
     }
 
     /// Lista las órdenes registradas de `aurora-forge` y las ramas `forge/*` pendientes de revisión.
@@ -3423,6 +3779,86 @@ fn persistir_catalogaciones(
     fs::rename(&tmp, ruta).map_err(|e| {
         DaemonError::Interno(format!(
             "error publicando catalogaciones '{}': {e}",
+            ruta.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn sanitizar_reporte_mision_para_nvme(
+    reporte: &ReporteMisionProyecto,
+    prospectos_activos: &[Prospecto],
+) -> ReporteMisionProyecto {
+    let mut limpio = reporte.clone();
+    let scrub = |texto: &str| -> String {
+        let (mut cur, _) = PiiFirewall::sanitizar_texto_generico(texto);
+        for p in prospectos_activos {
+            let (s, _) = PiiFirewall::sanitizar_para_nube(p, &cur);
+            cur = s;
+        }
+        cur
+    };
+    limpio.titulo = scrub(&limpio.titulo);
+    limpio.objetivo = scrub(&limpio.objetivo);
+    limpio.plan_bob = scrub(&limpio.plan_bob);
+    for st in &mut limpio.subtareas {
+        st.consigna = scrub(&st.consigna);
+        st.salida = scrub(&st.salida);
+    }
+    limpio
+}
+
+fn cargar_misiones_subdirector(ruta: &Path) -> DaemonResult<Vec<ReporteMisionProyecto>> {
+    if !ruta.is_file() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(ruta).map_err(|e| {
+        DaemonError::Interno(format!(
+            "error abriendo historial misiones_subdirector '{}': {e}",
+            ruta.display()
+        ))
+    })?;
+    let reader = BufReader::new(file);
+    let misiones: Vec<ReporteMisionProyecto> = serde_json::from_reader(reader).map_err(|e| {
+        DaemonError::Interno(format!(
+            "error deserializando historial misiones_subdirector '{}': {e}",
+            ruta.display()
+        ))
+    })?;
+    debug!(
+        total = misiones.len(),
+        "Historial sanitizado de misiones del Subdirector restaurado desde NVMe"
+    );
+    Ok(misiones)
+}
+
+fn persistir_misiones_subdirector(
+    ruta: &Path,
+    misiones: &[ReporteMisionProyecto],
+) -> DaemonResult<()> {
+    if let Some(padre) = ruta.parent() {
+        if !padre.as_os_str().is_empty() {
+            fs::create_dir_all(padre).map_err(|e| {
+                DaemonError::Interno(format!(
+                    "error creando directorio para misiones_subdirector.json '{}': {e}",
+                    padre.display()
+                ))
+            })?;
+        }
+    }
+    let json = serde_json::to_vec_pretty(misiones).map_err(|e| {
+        DaemonError::Interno(format!("error serializando misiones del Subdirector: {e}"))
+    })?;
+    let tmp = ruta.with_extension("json.tmp");
+    fs::write(&tmp, &json).map_err(|e| {
+        DaemonError::Interno(format!(
+            "error escribiendo misiones temporales '{}': {e}",
+            tmp.display()
+        ))
+    })?;
+    fs::rename(&tmp, ruta).map_err(|e| {
+        DaemonError::Interno(format!(
+            "error publicando misiones_subdirector.json '{}': {e}",
             ruta.display()
         ))
     })?;

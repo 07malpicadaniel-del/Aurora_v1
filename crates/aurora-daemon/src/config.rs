@@ -4,7 +4,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use aurora_council::{
-    ConfigCuotasConsejo, MiembroConsejo, PoliticaCuotaProveedor, DEFAULT_COUNCIL_CLI_TIMEOUT_MS,
+    AntigravityGeminiCliDriver, ClaudeCodeCliDriver, CodexCliDriver, ConfigCuotasConsejo,
+    CouncilAgentDriver, DiagnosticoSesionAgente, MiembroConsejo, OpenCodeCliDriver,
+    PoliticaCuotaProveedor, DEFAULT_COUNCIL_CLI_TIMEOUT_MS,
 };
 use aurora_domain::VerticalComercial;
 use aurora_factory::{ConfigHiggsfield, DEFAULT_HIGGSFIELD_API_URL};
@@ -62,6 +64,8 @@ pub struct ConfigCouncilDaemon {
     pub claude_bin: PathBuf,
     /// Binario o ruta para Codex CLI (`codex`).
     pub codex_bin: PathBuf,
+    /// Binario o ruta preferente para Antigravity CLI (`antigravity`, con respaldo `gemini_bin`).
+    pub antigravity_bin: PathBuf,
     /// Binario o ruta para Gemini CLI (`gemini`).
     pub gemini_bin: PathBuf,
     /// Binario o ruta para OpenCode CLI local (`opencode`).
@@ -74,9 +78,9 @@ pub struct ConfigCouncilDaemon {
     pub codex_max_5h: u32,
     /// Tope diario para Codex Plus.
     pub codex_max_diario: u32,
-    /// Tope móvil 5h para Gemini Estudiante.
+    /// Tope móvil 5h para Antigravity / Gemini.
     pub gemini_max_5h: u32,
-    /// Tope diario para Gemini Estudiante.
+    /// Tope diario para Antigravity / Gemini.
     pub gemini_max_diario: u32,
     /// Tope móvil 5h para OpenCode Local.
     pub opencode_max_5h: u32,
@@ -88,17 +92,22 @@ pub struct ConfigCouncilDaemon {
     pub timeout_ms: u64,
     /// Ruta explícita al archivo JSON persistente de cuotas (`<data_dir>/quota_state.json` si se omite).
     pub quota_state_path: Option<PathBuf>,
+    /// Directorio base para entornos aislados efímeros del Subdirector (`<data_dir>/sandboxes` si se omite).
+    pub sandbox_dir: Option<PathBuf>,
+    /// Raíz del proyecto Aurora v2 desde donde se lee la lista blanca de docs (`AURORA_PROJECT_ROOT` si se omite).
+    pub proyecto_root: Option<PathBuf>,
 }
 
 impl Default for ConfigCouncilDaemon {
     fn default() -> Self {
         let claude = PoliticaCuotaProveedor::por_defecto_para(MiembroConsejo::ClaudePro);
         let codex = PoliticaCuotaProveedor::por_defecto_para(MiembroConsejo::CodexPlus);
-        let gemini = PoliticaCuotaProveedor::por_defecto_para(MiembroConsejo::GeminiEstudiante);
+        let gemini = PoliticaCuotaProveedor::por_defecto_para(MiembroConsejo::AntigravityGemini);
         let opencode = PoliticaCuotaProveedor::por_defecto_para(MiembroConsejo::OpenCodeLocal);
         Self {
             claude_bin: PathBuf::from("claude"),
             codex_bin: PathBuf::from("codex"),
+            antigravity_bin: PathBuf::from("antigravity"),
             gemini_bin: PathBuf::from("gemini"),
             opencode_bin: PathBuf::from("opencode"),
             claude_max_5h: claude.max_tareas_ventana_5h,
@@ -112,6 +121,8 @@ impl Default for ConfigCouncilDaemon {
             cooldown_rate_limit_segundos: claude.cooldown_rate_limit_segundos,
             timeout_ms: DEFAULT_COUNCIL_CLI_TIMEOUT_MS,
             quota_state_path: None,
+            sandbox_dir: None,
+            proyecto_root: None,
         }
     }
 }
@@ -460,7 +471,7 @@ impl AuroraDaemonConfig {
                 },
             )
             .con_politica(
-                MiembroConsejo::GeminiEstudiante,
+                MiembroConsejo::AntigravityGemini,
                 PoliticaCuotaProveedor {
                     max_tareas_ventana_5h: self.council.gemini_max_5h,
                     max_tareas_diarias: self.council.gemini_max_diario,
@@ -511,6 +522,59 @@ impl AuroraDaemonConfig {
     #[must_use]
     pub fn catalogacion_path_efectivo(&self) -> PathBuf {
         self.wal_dir_efectivo().join("catalogacion_compra.json")
+    }
+
+    /// Directorio base efectivo para sandboxes efímeros del Subdirector (`<data_dir>/sandboxes`).
+    #[must_use]
+    pub fn sandbox_dir_efectivo(&self) -> PathBuf {
+        self.council
+            .sandbox_dir
+            .as_ref()
+            .map(|p| expandir_tilde_path(p))
+            .unwrap_or_else(|| self.data_dir_resuelto().join("sandboxes"))
+    }
+
+    /// Raíz efectiva del proyecto Aurora v2 para empaquetado de contexto lista blanca.
+    #[must_use]
+    pub fn proyecto_root_efectivo(&self) -> PathBuf {
+        if let Some(ref p) = self.council.proyecto_root {
+            return expandir_tilde_path(p);
+        }
+        if let Some(ref p) = self.forge.repo_root {
+            return expandir_tilde_path(p);
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            if cwd.join("AURORA_AGENT_CONTEXT.md").is_file() {
+                return cwd;
+            }
+        }
+        let default_ws = PathBuf::from("/home/daniel/.gemini/antigravity-ide/scratch/Aurora_v1");
+        if default_ws.join("AURORA_AGENT_CONTEXT.md").is_file() {
+            return default_ws;
+        }
+        std::env::current_dir().unwrap_or_else(|_| self.data_dir_resuelto())
+    }
+
+    /// Ruta del archivo JSON sanitizado del historial de misiones del Subdirector en `<wal_dir>`.
+    #[must_use]
+    pub fn misiones_subdirector_path_efectivo(&self) -> PathBuf {
+        self.wal_dir_efectivo().join("misiones_subdirector.json")
+    }
+
+    /// Indica si Higgsfield cuenta con clave API pagada configurada (`false` por defecto).
+    #[must_use]
+    pub fn higgsfield_pagado(&self) -> bool {
+        self.config_higgsfield().esta_configurado()
+    }
+
+    /// Modo operativo explícito de Higgsfield para telemetría y UI.
+    #[must_use]
+    pub fn higgsfield_modo(&self) -> &'static str {
+        if self.higgsfield_pagado() {
+            "api_pagada"
+        } else {
+            "cola_manual_sin_pago"
+        }
     }
 
     /// Construye la configuración de [`aurora_factory::ApiHiggsfieldClient`] desde `[factory]`.
@@ -757,6 +821,9 @@ impl AuroraDaemonConfig {
         if let Some(v) = leer_env("AURORA_CODEX_BIN").filter(|s| !s.trim().is_empty()) {
             self.council.codex_bin = PathBuf::from(v.trim());
         }
+        if let Some(v) = leer_env("AURORA_ANTIGRAVITY_BIN").filter(|s| !s.trim().is_empty()) {
+            self.council.antigravity_bin = PathBuf::from(v.trim());
+        }
         if let Some(v) = leer_env("AURORA_GEMINI_BIN").filter(|s| !s.trim().is_empty()) {
             self.council.gemini_bin = PathBuf::from(v.trim());
         }
@@ -765,6 +832,12 @@ impl AuroraDaemonConfig {
         }
         if let Some(v) = leer_env("AURORA_COUNCIL_QUOTA_PATH").filter(|s| !s.trim().is_empty()) {
             self.council.quota_state_path = Some(PathBuf::from(v.trim()));
+        }
+        if let Some(v) = leer_env("AURORA_SANDBOX_DIR").filter(|s| !s.trim().is_empty()) {
+            self.council.sandbox_dir = Some(PathBuf::from(v.trim()));
+        }
+        if let Some(v) = leer_env("AURORA_PROJECT_ROOT").filter(|s| !s.trim().is_empty()) {
+            self.council.proyecto_root = Some(PathBuf::from(v.trim()));
         }
         if let Some(v) = leer_env("AURORA_COUNCIL_TIMEOUT_MS").filter(|s| !s.trim().is_empty()) {
             self.council.timeout_ms = v.trim().parse::<u64>().map_err(|e| {
@@ -943,9 +1016,15 @@ pub struct ReporteSubsistemas {
     pub cdp_browser: EstadoSubsistema,
     /// Transporte ejecutivo SMTP (`rustls-tls` + cabecera LFPDPPP `List-Unsubscribe`).
     pub smtp_transport: EstadoSubsistema,
-    /// Disponibilidad sondeada de los CLIs del Consejo Multi-Agente (`claude`, `codex`, `gemini`, `opencode`).
+    /// Disponibilidad sondeada de los CLIs del Consejo Multi-Agente (`claude`, `codex`, `antigravity`/`gemini`, `opencode`).
     #[serde(default)]
     pub consejo_clis: Vec<EstadoSubsistema>,
+    /// Diagnóstico no intrusivo de los 5 agentes del Subdirector (`claude`, `codex`, `antigravity`, `opencode`, `bob_local`).
+    #[serde(default)]
+    pub subdirector_agentes: Vec<DiagnosticoSesionAgente>,
+    /// Modo operativo explícito de Higgsfield (`"cola_manual_sin_pago"` por defecto o `"api_pagada"`).
+    #[serde(default)]
+    pub higgsfield_modo: String,
 }
 
 impl ReporteSubsistemas {
@@ -967,7 +1046,7 @@ impl ReporteSubsistemas {
             .filter(|st| st.modo_real_activo)
             .count();
         format!(
-            "bob_llm={}, piper_tts={}, chromium_headless={}, ffmpeg_nvenc={}, cdp_browser={}, smtp_transport={}, consejo_clis_reales={}/{}",
+            "bob_llm={}, piper_tts={}, chromium_headless={}, ffmpeg_nvenc={}, cdp_browser={}, smtp_transport={}, consejo_clis_reales={}/{}, higgsfield_modo={}",
             mark(&self.bob_llm),
             mark(&self.piper_tts),
             mark(&self.chromium_headless),
@@ -976,6 +1055,11 @@ impl ReporteSubsistemas {
             mark(&self.smtp_transport),
             clis_reales,
             self.consejo_clis.len(),
+            if self.higgsfield_modo.is_empty() {
+                "cola_manual_sin_pago"
+            } else {
+                self.higgsfield_modo.as_str()
+            },
         )
     }
 
@@ -1017,7 +1101,8 @@ impl SubsystemProbe {
         let piper_tts = Self::sondear_piper(config, es_offline);
         let chromium_headless = Self::sondear_chromium(config, es_offline);
         let smtp_transport = Self::sondear_smtp(config, es_offline);
-        let consejo_clis = Self::sondear_consejo_clis(config, es_offline);
+        let (consejo_clis, subdirector_agentes) =
+            Self::sondear_agentes_subdirector(config, &bob_llm, es_offline);
 
         ReporteSubsistemas {
             bob_llm,
@@ -1027,55 +1112,80 @@ impl SubsystemProbe {
             cdp_browser,
             smtp_transport,
             consejo_clis,
+            subdirector_agentes,
+            higgsfield_modo: config.higgsfield_modo().to_string(),
         }
     }
 
-    fn sondear_consejo_clis(
+    fn sondear_agentes_subdirector(
         config: &AuroraDaemonConfig,
+        bob_llm: &EstadoSubsistema,
         es_offline: bool,
-    ) -> Vec<EstadoSubsistema> {
-        let entradas: &[(&str, &Path)] = &[
-            ("Consejo CLI: Claude Code", &config.council.claude_bin),
-            ("Consejo CLI: Codex", &config.council.codex_bin),
-            ("Consejo CLI: Gemini", &config.council.gemini_bin),
-            ("Consejo CLI: OpenCode", &config.council.opencode_bin),
+    ) -> (Vec<EstadoSubsistema>, Vec<DiagnosticoSesionAgente>) {
+        let claude = ClaudeCodeCliDriver::new(
+            expandir_tilde_path(&config.council.claude_bin),
+            config.council.timeout_ms,
+        );
+        let codex = CodexCliDriver::new(
+            expandir_tilde_path(&config.council.codex_bin),
+            config.council.timeout_ms,
+        );
+        let antigravity = AntigravityGeminiCliDriver::con_respaldo(
+            expandir_tilde_path(&config.council.antigravity_bin),
+            expandir_tilde_path(&config.council.gemini_bin),
+            config.council.timeout_ms,
+        );
+        let opencode = OpenCodeCliDriver::new(
+            expandir_tilde_path(&config.council.opencode_bin),
+            config.council.timeout_ms,
+        );
+
+        let externos: [(&str, &dyn CouncilAgentDriver); 4] = [
+            ("Consejo CLI: Claude Code", &claude),
+            ("Consejo CLI: Codex", &codex),
+            ("Consejo CLI: Antigravity / Gemini", &antigravity),
+            ("Consejo CLI: OpenCode", &opencode),
         ];
 
-        entradas
-            .iter()
-            .map(|(nombre, bin_raw)| {
-                let bin_cfg = expandir_tilde_path(bin_raw);
-                if es_offline {
-                    return EstadoSubsistema {
-                        nombre: (*nombre).to_string(),
-                        disponible: true,
-                        modo_real_activo: false,
-                        detalle: "Driver determinista offline activo (respaldo BOB Local)"
-                            .to_string(),
-                        ruta_o_endpoint: bin_cfg.display().to_string(),
-                    };
-                }
+        let mut consejo_clis = Vec::with_capacity(4);
+        let mut subdirector_agentes = Vec::with_capacity(5);
 
-                if let Some(bin) = resolver_binario_en_sistema(&bin_cfg, &[]) {
-                    EstadoSubsistema {
-                        nombre: (*nombre).to_string(),
-                        disponible: true,
-                        modo_real_activo: true,
-                        detalle: "Binario CLI headless detectado en sistema".to_string(),
-                        ruta_o_endpoint: bin.display().to_string(),
-                    }
-                } else {
-                    EstadoSubsistema {
-                        nombre: (*nombre).to_string(),
-                        disponible: false,
-                        modo_real_activo: false,
-                        detalle: "CLI no instalado en PATH (cascada degradará a BOB Local)"
-                            .to_string(),
-                        ruta_o_endpoint: bin_cfg.display().to_string(),
-                    }
+        for (nombre, driver) in externos {
+            let diag = if es_offline {
+                DiagnosticoSesionAgente {
+                    miembro: driver.miembro(),
+                    binario_encontrado: true,
+                    ruta_binario: Some(PathBuf::from("offline-mock")),
+                    sesion_local_detectada: true,
+                    detalle: "Driver determinista offline activo (respaldo BOB Local)".to_string(),
                 }
-            })
-            .collect()
+            } else {
+                driver.verificar_disponibilidad_y_sesion()
+            };
+
+            consejo_clis.push(EstadoSubsistema {
+                nombre: nombre.to_string(),
+                disponible: diag.binario_encontrado,
+                modo_real_activo: !es_offline && diag.binario_encontrado,
+                detalle: diag.detalle.clone(),
+                ruta_o_endpoint: diag
+                    .ruta_binario
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| driver.miembro().etiqueta().to_string()),
+            });
+            subdirector_agentes.push(diag);
+        }
+
+        subdirector_agentes.push(DiagnosticoSesionAgente {
+            miembro: MiembroConsejo::BobLocal,
+            binario_encontrado: bob_llm.disponible || es_offline,
+            ruta_binario: Some(PathBuf::from(&bob_llm.ruta_o_endpoint)),
+            sesion_local_detectada: true,
+            detalle: bob_llm.detalle.clone(),
+        });
+
+        (consejo_clis, subdirector_agentes)
     }
 
     async fn sondear_bob(

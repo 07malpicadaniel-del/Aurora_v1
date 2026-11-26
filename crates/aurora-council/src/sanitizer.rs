@@ -246,31 +246,42 @@ impl PiiFirewall {
         texto_contexto: &str,
     ) -> (String, MapaSanitizacionPii) {
         let mut mapa = MapaSanitizacionPii::default();
+        let texto = Self::sanitizar_para_nube_en_mapa(prospecto, texto_contexto, &mut mapa);
+        (texto, mapa)
+    }
+
+    /// Variante acumulativa sobre un [`MapaSanitizacionPii`] compartido en RAM
+    /// (ideal para misiones con múltiples prospectos referenciados sin colisión de marcadores).
+    #[must_use]
+    pub fn sanitizar_para_nube_en_mapa(
+        prospecto: &Prospecto,
+        texto_contexto: &str,
+        mapa: &mut MapaSanitizacionPii,
+    ) -> String {
         let mut texto = texto_contexto.to_string();
 
         // 1. Correos electrónicos (en texto o en aliases).
         if let Ok(re_email) = regex_email() {
-            texto = reemplazar_coincidencias_regex(&texto, re_email, "CORREO", &mut mapa, |_| true);
+            texto = reemplazar_coincidencias_regex(&texto, re_email, "CORREO", mapa, |_| true);
         }
 
         // 2. Teléfonos mexicanos (10 dígitos nacionales o +52 / +52 1).
         if let Ok(re_tel) = regex_tel_mx() {
-            texto = reemplazar_coincidencias_regex(&texto, re_tel, "TEL", &mut mapa, |m| {
+            texto = reemplazar_coincidencias_regex(&texto, re_tel, "TEL", mapa, |m| {
                 es_telefono_mx_valido(&texto, m.start(), m.end(), m.as_str())
             });
         }
 
         // 3. RFC mexicano (persona física o moral).
         if let Ok(re_rfc) = regex_rfc_mx() {
-            texto = reemplazar_coincidencias_regex(&texto, re_rfc, "RFC", &mut mapa, |m| {
+            texto = reemplazar_coincidencias_regex(&texto, re_rfc, "RFC", mapa, |m| {
                 es_rfc_mx_plausible(m.as_str())
             });
         }
 
         // 4. Direcciones específicas (calle/av/blvd + número + colonia/CP).
         if let Ok(re_dir) = regex_direccion_mx() {
-            texto =
-                reemplazar_coincidencias_regex(&texto, re_dir, "DIRECCION", &mut mapa, |_| true);
+            texto = reemplazar_coincidencias_regex(&texto, re_dir, "DIRECCION", mapa, |_| true);
         }
 
         // 5. Nombre normalizado principal del prospecto -> [PROSPECTO_01].
@@ -304,7 +315,7 @@ impl PiiFirewall {
             }
         }
 
-        (texto, mapa)
+        texto
     }
 
     /// Sanitiza texto genérico cuando la delegación no está asociada a un `Prospecto` concreto.

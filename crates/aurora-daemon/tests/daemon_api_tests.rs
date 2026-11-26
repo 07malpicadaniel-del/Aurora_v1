@@ -2,7 +2,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use aurora_council::{MiembroConsejo, ResultadoDelegacion, TipoTareaConsejo};
+use aurora_council::{
+    EstadoSubtarea, MiembroConsejo, ReporteMisionProyecto, ResultadoDelegacion, RolEspecialista,
+    SolicitudMisionProyecto, TipoTareaConsejo,
+};
 use aurora_daemon::{
     crear_router, AprobarOrdenRequest, AprobarOrdenResponse, AuroraDaemonState,
     BrollEstadoResponse, CatalogarProspectosRequest, CatalogarProspectosResponse,
@@ -11,7 +14,8 @@ use aurora_daemon::{
     GenerarBriefsHiggsfieldResponse, GenerarMonetizacionRequest, GenerarMonetizacionResponse,
     HealthResponse, HuntRequest, HuntResponse, OptOutRequest, OptOutResponse, OrdenPendienteDto,
     ProspectosDbResponse, PublicarOrganicoRequest, PublicarOrganicoResponse, PulseEstadoResponse,
-    PulseOrganicoResponse, RechazarOrdenRequest, RegistrarClipBrollRequest, TelaranaResponse,
+    PulseOrganicoResponse, RechazarOrdenRequest, RegistrarClipBrollRequest,
+    SubdirectorAgentesResponse, SubdirectorMisionesResponse, TelaranaResponse,
 };
 use aurora_domain::{
     EstadoAprobacion, ObjetivoContenidoVideo, PerfilPsicologico, SubverticalInmobiliaria,
@@ -915,6 +919,119 @@ async fn endpoints_http_prospectos_db_catalogacion_opt_out_monetizacion_y_tiktok
     assert_eq!(comp_tt.plataforma, PlataformaPulso::TikTok);
     assert!(comp_tt.url_publica.starts_with("https://www.tiktok.com/"));
     assert!(resp_mon_ok.resultado_higgsfield.is_some());
+
+    server_handle.abort();
+    let _ = fs::remove_dir_all(&base_dir);
+    Ok(())
+}
+
+
+#[tokio::test]
+async fn endpoints_http_subdirector_agentes_y_misiones_paralelas_cero_fugas(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base_dir = dir_temporal_daemon("aurora_daemon_subdirector_test");
+    let (base_url, server_handle) = levantar_servidor_efimero(&base_dir).await?;
+    let client = Client::new();
+
+    // 1. /api/v1/health incluye diagnóstico de los 5 agentes del Subdirector y modo Higgsfield manual.
+    let health: HealthResponse = client
+        .get(format!("{base_url}/api/v1/health"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(health.subsistemas.subdirector_agentes.len(), 5);
+    assert_eq!(health.subsistemas.higgsfield_modo, "cola_manual_sin_pago");
+
+    // 2. GET /api/v1/subdirector/agentes expone los 5 agentes, cuotas y modo Higgsfield manual.
+    let agentes: SubdirectorAgentesResponse = client
+        .get(format!("{base_url}/api/v1/subdirector/agentes"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(agentes.agentes.len(), 5);
+    assert_eq!(agentes.higgsfield_modo, "cola_manual_sin_pago");
+    assert!(!agentes.higgsfield_pagado);
+    assert!(agentes
+        .agentes
+        .iter()
+        .any(|a| a.miembro == MiembroConsejo::AntigravityGemini && a.disponible));
+
+    // 3. POST /api/v1/subdirector/misiones bloquea con 422 si hay un secreto en el objetivo.
+    let resp_bloqueada = client
+        .post(format!("{base_url}/api/v1/subdirector/misiones"))
+        .json(&SolicitudMisionProyecto {
+            titulo: "Misión insegura".to_string(),
+            objetivo: "Usar clave ghp_1234567890abcdefghijklmnopqrstuvwx en producción".to_string(),
+            vertical: None,
+            tracks: vec![RolEspecialista::GuionesYCopy],
+            incluir_contexto_proyecto: false,
+            prospecto_ids: Vec::new(),
+            ejecutar_forge_en_codigo: false,
+            higgsfield_pagado: false,
+            timeout_ms: Some(3_000),
+        })
+        .send()
+        .await?;
+    assert_eq!(resp_bloqueada.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // 4. POST /api/v1/subdirector/misiones orquesta en paralelo los 3 especialistas sobre sandbox aislado.
+    let reporte: ReporteMisionProyecto = client
+        .post(format!("{base_url}/api/v1/subdirector/misiones"))
+        .json(&SolicitudMisionProyecto {
+            titulo: "Campaña Naves Industriales Monterrey".to_string(),
+            objetivo: "Crear guion de alto ticket, diseño de conector OSINT y escenas 9:16 (>=61s)."
+                .to_string(),
+            vertical: Some(VerticalComercial::Inmobiliaria(
+                SubverticalInmobiliaria::ComercialIndustrial,
+            )),
+            tracks: vec![
+                RolEspecialista::GuionesYCopy,
+                RolEspecialista::IngenieriaYConectores,
+                RolEspecialista::DireccionVideoYContexto,
+            ],
+            incluir_contexto_proyecto: true,
+            prospecto_ids: Vec::new(),
+            ejecutar_forge_en_codigo: false,
+            higgsfield_pagado: true,
+            timeout_ms: Some(5_000),
+        })
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    assert_eq!(reporte.subtareas.len(), 3);
+    assert!(reporte.auditoria_privacidad.libre_de_fugas);
+    assert!(reporte.sandbox_limpiado);
+    // Aunque el payload pidió higgsfield_pagado = true, al no existir API key el daemon fuerza modo manual.
+    assert_eq!(reporte.higgsfield_modo, "cola_manual_sin_pago");
+    assert_eq!(reporte.subtareas[0].miembro_ejecutor, MiembroConsejo::ClaudePro);
+    assert_eq!(reporte.subtareas[1].miembro_ejecutor, MiembroConsejo::CodexPlus);
+    assert_eq!(
+        reporte.subtareas[2].miembro_ejecutor,
+        MiembroConsejo::AntigravityGemini
+    );
+    for st in &reporte.subtareas {
+        assert_eq!(st.estado, EstadoSubtarea::Completada);
+    }
+
+    // 5. Persistencia sanitizada en <wal_dir>/misiones_subdirector.json y lectura vía GET.
+    assert!(base_dir.join("wal/misiones_subdirector.json").is_file());
+    let historial: SubdirectorMisionesResponse = client
+        .get(format!("{base_url}/api/v1/subdirector/misiones"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(historial.total, 1);
+    assert_eq!(historial.misiones[0].mision_id, reporte.mision_id);
+    assert_eq!(historial.higgsfield_modo, "cola_manual_sin_pago");
 
     server_handle.abort();
     let _ = fs::remove_dir_all(&base_dir);

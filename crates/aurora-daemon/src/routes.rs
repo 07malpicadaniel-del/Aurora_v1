@@ -2,7 +2,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aurora_council::ResultadoDelegacion;
+use aurora_council::{ReporteMisionProyecto, ResultadoDelegacion, SolicitudMisionProyecto};
 use aurora_factory::ClipBroll;
 use aurora_pulse::{EstadoCampanaProspecto, EventoTelemetria};
 use axum::body::Bytes;
@@ -33,7 +33,7 @@ use crate::state::{
     HealthResponse, HuntRequest, HuntResponse, OptOutRequest, OptOutResponse, OrdenPendienteDto,
     ProspectosDbResponse, PublicarOrganicoRequest, PublicarOrganicoResponse, PulseEstadoResponse,
     PulseOrganicoResponse, RechazarOrdenRequest, RegistrarClipBrollRequest, RegistroOrdenForjaDto,
-    TelaranaResponse,
+    SubdirectorAgentesResponse, SubdirectorMisionesResponse, TelaranaResponse,
 };
 use aurora_memory::SubgrafoProspecto;
 
@@ -80,6 +80,14 @@ pub fn crear_router(state: Arc<AuroraDaemonState>) -> Router {
         .route("/api/v1/dpo/consolidar", post(handler_dpo_consolidar))
         .route("/api/v1/council/cuotas", get(handler_council_cuotas))
         .route("/api/v1/council/delegar", post(handler_council_delegar))
+        .route(
+            "/api/v1/subdirector/agentes",
+            get(handler_subdirector_agentes),
+        )
+        .route(
+            "/api/v1/subdirector/misiones",
+            get(handler_subdirector_misiones_listar).post(handler_subdirector_misiones_lanzar),
+        )
         .route(
             "/api/v1/forge/ordenes",
             get(handler_forge_ordenes_listar).post(handler_forge_ordenes_crear),
@@ -253,6 +261,26 @@ async fn handler_council_delegar(
     Json(req): Json<DelegarConsejoRequest>,
 ) -> DaemonResult<Json<ResultadoDelegacion>> {
     let resp = state.delegar_consejo(req).await?;
+    Ok(Json(resp))
+}
+
+async fn handler_subdirector_agentes(
+    State(state): State<Arc<AuroraDaemonState>>,
+) -> Json<SubdirectorAgentesResponse> {
+    Json(state.obtener_agentes_subdirector().await)
+}
+
+async fn handler_subdirector_misiones_listar(
+    State(state): State<Arc<AuroraDaemonState>>,
+) -> Json<SubdirectorMisionesResponse> {
+    Json(state.listar_misiones_subdirector())
+}
+
+async fn handler_subdirector_misiones_lanzar(
+    State(state): State<Arc<AuroraDaemonState>>,
+    Json(req): Json<SolicitudMisionProyecto>,
+) -> DaemonResult<Json<ReporteMisionProyecto>> {
+    let resp = state.lanzar_mision_subdirector(req).await?;
     Ok(Json(resp))
 }
 
