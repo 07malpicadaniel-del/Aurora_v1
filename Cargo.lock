@@ -56,13 +56,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "aurora-daemon"
+name = "aurora-council"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "aurora-cortex",
  "aurora-domain",
+ "chrono",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "aurora-daemon"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aurora-cortex",
+ "aurora-council",
+ "aurora-domain",
  "aurora-factory",
+ "aurora-forge",
  "aurora-memory",
  "aurora-osint",
  "aurora-pulse",
@@ -106,6 +125,22 @@ dependencies = [
  "aurora-osint",
  "chrono",
  "serde",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "aurora-forge"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "aurora-council",
+ "aurora-domain",
+ "chrono",
+ "serde",
+ "serde_json",
  "thiserror",
  "tokio",
  "tracing",

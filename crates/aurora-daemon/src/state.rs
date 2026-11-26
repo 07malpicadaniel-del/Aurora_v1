@@ -11,6 +11,11 @@ use aurora_cortex::{
     OrquestadorComercialBob, PlanAtaqueComercial, PlataformaCalentamiento, ResultadoEjecucionTool,
     RolCognitivo, TipoInteraccionPeriferica, ToolDispatcher,
 };
+use aurora_council::{
+    BobLocalFallbackDriver, ClaudeCodeCliDriver, CodexCliDriver, DeterministicMockCouncilDriver,
+    EstadoCuotaMiembro, GeminiCliDriver, MiembroConsejo, OpenCodeCliDriver, OrquestadorConsejo,
+    PeticionDelegacion, QuotaGovernor, ResultadoDelegacion, TipoTareaConsejo,
+};
 use aurora_domain::{
     validar_prospecto, EstadoAprobacion, PerfilPsicologico, Prospecto, TipoGatilloVital,
     TipoVinculo, Ubicacion, VerticalComercial,
@@ -21,6 +26,11 @@ use aurora_factory::{
     DocumentEngine, FabricaMultimodalAurora, FfmpegNvencComposer, HeadlessBrowserDocumentEngine,
     PaqueteManufacturado, PiperCpuTtsEngine, ResultadoAudio, ResultadoVideo, SolicitudManufactura,
     TtsEngine, VideoComposer,
+};
+use aurora_forge::{
+    listar_ramas_forge, validar_rutas_permitidas, ComandoValidacion, ConfigSandboxForja,
+    CouncilForgeExecutor, EstadoOrdenIngenieria, OrdenIngenieria, ReporteForja,
+    TipoOrdenIngenieria, WorktreeSandbox,
 };
 use aurora_memory::{
     ConfigDecaimiento4D, ConfigEmbedderMultilingue, DeterministicSimdEmbedder, GatilloVigente,
@@ -54,8 +64,8 @@ use crate::adapters::{
     HybridVideoComposer,
 };
 use crate::config::{
-    resolver_binario_en_sistema, AuroraDaemonConfig, ModoEjecucion, ReporteSubsistemas,
-    SubsystemProbe,
+    expandir_tilde_path, resolver_binario_en_sistema, AuroraDaemonConfig, ModoEjecucion,
+    ReporteSubsistemas, SubsystemProbe,
 };
 use crate::error::{DaemonError, DaemonResult};
 use crate::scheduler::EstadoSchedulerDpo;
@@ -511,6 +521,81 @@ pub struct DpoConsolidarResponse {
     pub dataset: DatasetPreferenciasDpo,
 }
 
+/// Respuesta de `GET /api/v1/council/cuotas`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CouncilCuotasResponse {
+    /// Orden de cascada actualmente disponible (siempre termina en `BobLocal`).
+    pub cascada_vigente: Vec<MiembroConsejo>,
+    /// Estado detallado de ventanas 5h, topes diarios y cooldowns por miembro.
+    pub miembros: Vec<EstadoCuotaMiembro>,
+}
+
+/// Solicitud para `POST /api/v1/council/delegar`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegarConsejoRequest {
+    /// Especialidad de tarea del consejo multi-agente.
+    pub tarea: TipoTareaConsejo,
+    /// Contexto o consigna a resolver.
+    pub contexto: String,
+    /// UUID de un prospecto en memoria 4D para activar `PiiFirewall` automáticamente.
+    #[serde(default)]
+    pub prospecto_id: Option<Uuid>,
+    /// Prospecto opcional en línea (alternativo a `prospecto_id`) para sanitización `PiiFirewall`.
+    #[serde(default)]
+    pub prospecto: Option<Prospecto>,
+    /// Si es `true`, resuelve directo en `BobLocal` sin consumir cuotas de nube.
+    #[serde(default)]
+    pub forzar_local: Option<bool>,
+    /// Timeout explícito opcional en milisegundos.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+/// Registro persistente y visible de una orden de ingeniería ejecutada por `aurora-forge`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistroOrdenForjaDto {
+    /// Definición y estado vigente de la orden de ingeniería.
+    pub orden: OrdenIngenieria,
+    /// Reporte verificable con rama `forge/<id>` y commit cuando superó las compuertas.
+    pub reporte: Option<ReporteForja>,
+    /// Motivo de aborto cuando el estado es `Fallida`.
+    pub error: Option<String>,
+    /// Última actualización UTC.
+    pub actualizado_en: DateTime<Utc>,
+}
+
+/// Respuesta de `GET /api/v1/forge/ordenes`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForgeOrdenesResponse {
+    /// Indica si `aurora-forge` está habilitado en configuración.
+    pub habilitado: bool,
+    /// Total de órdenes registradas en el historial.
+    pub total_ordenes: usize,
+    /// Total de órdenes listas en Carril Ámbar esperando revisión humana.
+    pub pendientes_revision_humana: usize,
+    /// Ramas `forge/*` existentes actualmente en el repositorio Git configurado.
+    pub ramas_forge: Vec<String>,
+    /// Historial de órdenes de ingeniería y reportes.
+    pub ordenes: Vec<RegistroOrdenForjaDto>,
+}
+
+/// Solicitud para `POST /api/v1/forge/ordenes`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrearOrdenForjaRequest {
+    /// Categoría de ingeniería autónoma permitida.
+    pub tipo: TipoOrdenIngenieria,
+    /// Descripción técnica precisa del cambio solicitado.
+    pub descripcion_tecnica: String,
+    /// Lista blanca explícita de rutas relativas autorizadas (prohibido incluir rutas protegidas).
+    pub rutas_permitidas: Vec<String>,
+    /// Compuerta determinista de validación (por defecto `CargoCheckClippyTest`).
+    #[serde(default)]
+    pub comando_validacion: Option<ComandoValidacion>,
+    /// Repositorio Git opcional a usar para el worktree (si se omite, usa `forge.repo_root`).
+    #[serde(default)]
+    pub repo_root: Option<PathBuf>,
+}
+
 /// Evento emitido en tiempo real hacia `/api/v1/eventos/stream`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventoDaemon {
@@ -574,11 +659,14 @@ pub struct AuroraDaemonState {
     despachador: DespachadorMulticanal<DynChannelTransport>,
     telemetria: Arc<RecolectorTelemetria>,
     motor_dpo: MotorConsolidacionNocturna<DynBobBackend>,
+    consejo: Arc<OrquestadorConsejo>,
     scheduler_estado: Mutex<EstadoSchedulerDpo>,
     cola_gatekeeper: Mutex<BTreeMap<Uuid, RegistroOrdenInterno>>,
+    forge_ordenes: Mutex<Vec<RegistroOrdenForjaDto>>,
     calentamientos_recientes: Mutex<Vec<RegistroInteraccion>>,
     despachos_recientes: Mutex<Vec<ComprobanteDespacho>>,
     ruta_cola_persistida: Option<PathBuf>,
+    ruta_forge_persistida: Option<PathBuf>,
     eventos_tx: broadcast::Sender<EventoDaemon>,
 }
 
@@ -779,14 +867,68 @@ impl AuroraDaemonState {
         ruta_cola_persistida: Option<PathBuf>,
     ) -> DaemonResult<Arc<Self>> {
         let rate_limiter = Arc::new(ControladorTasaPlataforma::default());
+        let bob_slot_lock = Arc::new(tokio::sync::Mutex::new(()));
         let orquestador = OrquestadorComercialBob::new(DynBobBackend(bob_backend.clone()));
         let motor_dpo = MotorConsolidacionNocturna::new(
-            OrquestadorComercialBob::new(DynBobBackend(bob_backend)),
+            OrquestadorComercialBob::new(DynBobBackend(bob_backend.clone())),
             ConfigConsolidacionNocturna {
                 directorio_salida_dpo: dpo_dir,
                 ..ConfigConsolidacionNocturna::default()
             },
         );
+
+        let governor = Arc::new(QuotaGovernor::abrir(
+            config.construir_config_cuotas_consejo(),
+        )?);
+        let mut consejo_builder = OrquestadorConsejo::new(governor)
+            .con_timeout_por_defecto_ms(config.council.timeout_ms);
+        if matches!(config.modo_efectivo(), ModoEjecucion::SimuladoOffline) {
+            consejo_builder = consejo_builder
+                .con_driver(Arc::new(DeterministicMockCouncilDriver::exito(
+                    MiembroConsejo::ClaudePro,
+                    "[Consejo Offline] Propuesta generada para: {prompt}",
+                )))
+                .con_driver(Arc::new(DeterministicMockCouncilDriver::no_disponible(
+                    MiembroConsejo::CodexPlus,
+                )))
+                .con_driver(Arc::new(DeterministicMockCouncilDriver::no_disponible(
+                    MiembroConsejo::GeminiEstudiante,
+                )))
+                .con_driver(Arc::new(DeterministicMockCouncilDriver::no_disponible(
+                    MiembroConsejo::OpenCodeLocal,
+                )));
+        } else {
+            consejo_builder = consejo_builder
+                .con_driver(Arc::new(ClaudeCodeCliDriver::new(
+                    expandir_tilde_path(&config.council.claude_bin),
+                    config.council.timeout_ms,
+                )))
+                .con_driver(Arc::new(CodexCliDriver::new(
+                    expandir_tilde_path(&config.council.codex_bin),
+                    config.council.timeout_ms,
+                )))
+                .con_driver(Arc::new(GeminiCliDriver::new(
+                    expandir_tilde_path(&config.council.gemini_bin),
+                    config.council.timeout_ms,
+                )))
+                .con_driver(Arc::new(OpenCodeCliDriver::new(
+                    expandir_tilde_path(&config.council.opencode_bin),
+                    config.council.timeout_ms,
+                )));
+        }
+        let consejo = Arc::new(
+            consejo_builder.con_driver(Arc::new(
+                BobLocalFallbackDriver::new(DynBobBackend(bob_backend))
+                    .con_slot_lock(Arc::clone(&bob_slot_lock)),
+            )),
+        );
+
+        let ruta_forge_persistida = Some(config.forge_ordenes_path_efectivo());
+        let forge_inicial = if let Some(ref ruta) = ruta_forge_persistida {
+            cargar_ordenes_forge(ruta)?
+        } else {
+            Vec::new()
+        };
         let fabrica = FabricaMultimodalAurora::new(
             ConfigFabrica {
                 directorio_base: factory_dir,
@@ -834,7 +976,7 @@ impl AuroraDaemonState {
             cdp_fetcher,
             memoria: RwLock::new(memoria),
             osint_fuentes: RwLock::new(fuentes_iniciales),
-            bob_slot_lock: Arc::new(tokio::sync::Mutex::new(())),
+            bob_slot_lock,
             orquestador,
             fabrica,
             rate_limiter,
@@ -842,11 +984,14 @@ impl AuroraDaemonState {
             despachador,
             telemetria: Arc::new(RecolectorTelemetria::new()),
             motor_dpo,
+            consejo,
             scheduler_estado: Mutex::new(scheduler_inicial),
             cola_gatekeeper: Mutex::new(cola_inicial),
+            forge_ordenes: Mutex::new(forge_inicial),
             calentamientos_recientes: Mutex::new(Vec::new()),
             despachos_recientes: Mutex::new(Vec::new()),
             ruta_cola_persistida,
+            ruta_forge_persistida,
             eventos_tx,
         }))
     }
@@ -966,7 +1111,11 @@ impl AuroraDaemonState {
             let cola = self.cola_gatekeeper.lock();
             persistir_cola_gatekeeper(ruta, &cola)?;
         }
-        info!("WAL 4D compactado y cola Gatekeeper persistida en apagado ordenado");
+        if let Some(ref ruta) = self.ruta_forge_persistida {
+            let ordenes = self.forge_ordenes.lock();
+            persistir_ordenes_forge(ruta, &ordenes)?;
+        }
+        info!("WAL 4D compactado y colas persistidas en apagado ordenado");
         Ok(())
     }
 
@@ -1728,6 +1877,173 @@ impl AuroraDaemonState {
         Ok(resp)
     }
 
+    /// Devuelve el estado actual de ventanas 5h, topes diarios y cooldowns del Consejo Multi-Agente.
+    pub async fn obtener_cuotas_consejo(&self) -> CouncilCuotasResponse {
+        let gov = self.consejo.governor();
+        let cascada_vigente = gov.orden_cascada_vigente().await;
+        let miembros = gov.estado_todas_las_cuotas().await;
+        CouncilCuotasResponse {
+            cascada_vigente,
+            miembros,
+        }
+    }
+
+    /// Delega una tarea a través de [`OrquestadorConsejo`] con `PiiFirewall` LFPDPPP activo.
+    #[tracing::instrument(skip(self, req), fields(tarea = req.tarea.etiqueta()))]
+    pub async fn delegar_consejo(
+        &self,
+        req: DelegarConsejoRequest,
+    ) -> DaemonResult<ResultadoDelegacion> {
+        if req.contexto.trim().is_empty() {
+            return Err(DaemonError::SolicitudInvalida(
+                "el campo 'contexto' es obligatorio para delegar al consejo".to_string(),
+            ));
+        }
+
+        let prospecto = if let Some(p) = req.prospecto {
+            if p.lfpdppp.opt_out {
+                return Err(DaemonError::OptOutActivo(p.id));
+            }
+            Some(p)
+        } else if let Some(pid) = req.prospecto_id {
+            let mem = self.memoria.read().await;
+            if mem.esta_en_blacklist(pid) {
+                return Err(DaemonError::OptOutActivo(pid));
+            }
+            let reg = mem
+                .grafo()
+                .obtener_por_uuid(pid)
+                .ok_or(DaemonError::ProspectoNoEncontrado(pid))?;
+            Some(reg.prospecto.clone())
+        } else {
+            None
+        };
+
+        let resultado = self
+            .consejo
+            .delegar(PeticionDelegacion {
+                tarea: req.tarea,
+                contexto: req.contexto,
+                prospecto,
+                forzar_local: req.forzar_local.unwrap_or(false),
+                directorio_trabajo: None,
+                timeout_ms: req.timeout_ms,
+            })
+            .await?;
+
+        self.emitir_evento(
+            "ConsejoDelegado",
+            serde_json::json!({
+                "solicitud_id": resultado.solicitud_id,
+                "tarea": resultado.tarea.etiqueta(),
+                "miembro_respondedor": resultado.miembro_respondedor.etiqueta(),
+                "hubo_fallback": resultado.hubo_fallback,
+                "latencia_ms": resultado.latencia_ms,
+                "pii_sanitizado": resultado.pii_sanitizado,
+            }),
+        );
+
+        Ok(resultado)
+    }
+
+    /// Lista las órdenes registradas de `aurora-forge` y las ramas `forge/*` pendientes de revisión.
+    pub async fn listar_ordenes_forge(&self) -> ForgeOrdenesResponse {
+        let repo_root = self.config.forge_repo_root_efectivo();
+        let ramas_forge = listar_ramas_forge(&repo_root).await.unwrap_or_default();
+
+        let ordenes = self.forge_ordenes.lock().clone();
+        let pendientes_revision_humana = ordenes
+            .iter()
+            .filter(|o| o.orden.estado == EstadoOrdenIngenieria::PendienteRevisionHumana)
+            .count();
+
+        ForgeOrdenesResponse {
+            habilitado: self.config.forge.habilitado,
+            total_ordenes: ordenes.len(),
+            pendientes_revision_humana,
+            ramas_forge,
+            ordenes,
+        }
+    }
+
+    /// Registra y ejecuta una [`OrdenIngenieria`] en un `git worktree` aislado de `aurora-forge`.
+    #[tracing::instrument(skip(self, req), fields(tipo = req.tipo.etiqueta()))]
+    pub async fn crear_y_ejecutar_orden_forge(
+        &self,
+        req: CrearOrdenForjaRequest,
+    ) -> DaemonResult<RegistroOrdenForjaDto> {
+        if !self.config.forge.habilitado {
+            return Err(DaemonError::SolicitudInvalida(
+                "aurora-forge está deshabilitado en la configuración ([forge].habilitado = false)"
+                    .to_string(),
+            ));
+        }
+
+        validar_rutas_permitidas(&req.rutas_permitidas)?;
+
+        let mut orden = OrdenIngenieria::nueva(
+            req.tipo,
+            req.descripcion_tecnica,
+            req.rutas_permitidas,
+            req.comando_validacion
+                .unwrap_or(ComandoValidacion::CargoCheckClippyTest),
+        );
+
+        let repo_root = req
+            .repo_root
+            .map(|p| expandir_tilde_path(&p))
+            .unwrap_or_else(|| self.config.forge_repo_root_efectivo());
+
+        let sandbox = WorktreeSandbox::new(ConfigSandboxForja {
+            repo_root,
+            worktrees_dir: self.config.forge_worktrees_dir_efectivo(),
+            timeout_segundos: self.config.forge.timeout_segundos,
+        });
+        let executor =
+            CouncilForgeExecutor::new(Arc::clone(&self.consejo), self.config.council.timeout_ms);
+
+        match sandbox.ejecutar_orden(&mut orden, &executor).await {
+            Ok(reporte) => {
+                let dto = RegistroOrdenForjaDto {
+                    orden,
+                    reporte: Some(reporte.clone()),
+                    error: None,
+                    actualizado_en: Utc::now(),
+                };
+                self.guardar_orden_forge(dto.clone())?;
+                self.emitir_evento(
+                    "OrdenForjaCompletada",
+                    serde_json::json!({
+                        "orden_id": dto.orden.id,
+                        "rama_forge": reporte.rama_forge,
+                        "estado": dto.orden.estado,
+                        "archivos_modificados": reporte.archivos_modificados,
+                    }),
+                );
+                Ok(dto)
+            }
+            Err(err) => {
+                let dto = RegistroOrdenForjaDto {
+                    orden,
+                    reporte: None,
+                    error: Some(err.to_string()),
+                    actualizado_en: Utc::now(),
+                };
+                let _ = self.guardar_orden_forge(dto);
+                Err(DaemonError::Forja(err))
+            }
+        }
+    }
+
+    fn guardar_orden_forge(&self, dto: RegistroOrdenForjaDto) -> DaemonResult<()> {
+        let mut ordenes = self.forge_ordenes.lock();
+        ordenes.push(dto);
+        if let Some(ref ruta) = self.ruta_forge_persistida {
+            persistir_ordenes_forge(ruta, &ordenes)?;
+        }
+        Ok(())
+    }
+
     fn emitir_evento(&self, tipo: &str, payload: serde_json::Value) {
         let _ = self.eventos_tx.send(EventoDaemon {
             tipo: tipo.to_string(),
@@ -1864,6 +2180,56 @@ fn persistir_cola_gatekeeper(
     fs::rename(&tmp, ruta).map_err(|e| {
         DaemonError::Interno(format!(
             "error publicando cola Gatekeeper '{}': {e}",
+            ruta.display()
+        ))
+    })?;
+    Ok(())
+}
+
+fn cargar_ordenes_forge(ruta: &Path) -> DaemonResult<Vec<RegistroOrdenForjaDto>> {
+    if !ruta.is_file() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(ruta).map_err(|e| {
+        DaemonError::Interno(format!(
+            "error abriendo historial de aurora-forge '{}': {e}",
+            ruta.display()
+        ))
+    })?;
+    let reader = BufReader::new(file);
+    let regs: Vec<RegistroOrdenForjaDto> = serde_json::from_reader(reader).map_err(|e| {
+        DaemonError::Interno(format!(
+            "error deserializando historial de aurora-forge '{}': {e}",
+            ruta.display()
+        ))
+    })?;
+    Ok(regs)
+}
+
+fn persistir_ordenes_forge(ruta: &Path, ordenes: &[RegistroOrdenForjaDto]) -> DaemonResult<()> {
+    if let Some(padre) = ruta.parent() {
+        if !padre.as_os_str().is_empty() {
+            fs::create_dir_all(padre).map_err(|e| {
+                DaemonError::Interno(format!(
+                    "error creando directorio de historial forge '{}': {e}",
+                    padre.display()
+                ))
+            })?;
+        }
+    }
+    let json = serde_json::to_vec_pretty(ordenes).map_err(|e| {
+        DaemonError::Interno(format!("error serializando historial de aurora-forge: {e}"))
+    })?;
+    let tmp = ruta.with_extension("json.tmp");
+    fs::write(&tmp, &json).map_err(|e| {
+        DaemonError::Interno(format!(
+            "error escribiendo historial temporal de aurora-forge '{}': {e}",
+            tmp.display()
+        ))
+    })?;
+    fs::rename(&tmp, ruta).map_err(|e| {
+        DaemonError::Interno(format!(
+            "error publicando historial de aurora-forge '{}': {e}",
             ruta.display()
         ))
     })?;

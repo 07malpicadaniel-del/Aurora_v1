@@ -63,3 +63,30 @@ url_base_opt_out = "http://127.0.0.1:8090/api/v1/lfpdppp/opt-out"
 adjuntar_dossier_pdf = true
 adjuntar_reel_si_menor_a_mb = 12
 timeout_ms = 15000
+
+[council]
+# Binarios CLI headless del Consejo Multi-Agente (cascada Claude -> Codex -> Gemini -> OpenCode -> BOB Local)
+claude_bin = "claude"
+codex_bin = "codex"
+gemini_bin = "gemini"
+opencode_bin = "opencode"
+# Presupuestos conservadores de ventana móvil de 5 horas y tope diario para proteger suscripciones Pro/Plus
+claude_max_5h = 10
+claude_max_diario = 30
+codex_max_5h = 12
+codex_max_diario = 36
+gemini_max_5h = 25
+gemini_max_diario = 100
+opencode_max_5h = 60
+opencode_max_diario = 240
+cooldown_rate_limit_segundos = 1800
+timeout_ms = 90000
+# Ruta persistente atómica del libro de cuotas en NVMe (si se omite usa <data_dir>/quota_state.json)
+quota_state_path = "~/.local/share/aurora/quota_state.json"
+
+[forge]
+# Sandbox aislado en git worktree bajo ramas forge/<id> (Carril Ámbar: prohibido tocar main o auto-merge)
+habilitado = true
+worktrees_dir = "~/.local/share/aurora/forge_worktrees"
+# repo_root = "/ruta/al/repositorio/Aurora_v1"
+timeout_segundos = 300

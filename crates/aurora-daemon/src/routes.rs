@@ -2,6 +2,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aurora_council::ResultadoDelegacion;
 use aurora_pulse::{EstadoCampanaProspecto, EventoTelemetria};
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -19,10 +20,11 @@ use uuid::Uuid;
 use crate::config::ReporteSubsistemas;
 use crate::error::{DaemonError, DaemonResult};
 use crate::state::{
-    AprobarOrdenRequest, AprobarOrdenResponse, AuroraDaemonState, DpoConsolidarResponse,
+    AprobarOrdenRequest, AprobarOrdenResponse, AuroraDaemonState, CouncilCuotasResponse,
+    CrearOrdenForjaRequest, DelegarConsejoRequest, DpoConsolidarResponse, ForgeOrdenesResponse,
     GatekeeperPendientesResponse, HealthResponse, HuntRequest, HuntResponse, OptOutRequest,
     OptOutResponse, OrdenPendienteDto, PulseEstadoResponse, RechazarOrdenRequest,
-    TelaranaResponse,
+    RegistroOrdenForjaDto, TelaranaResponse,
 };
 use aurora_memory::SubgrafoProspecto;
 
@@ -57,6 +59,12 @@ pub fn crear_router(state: Arc<AuroraDaemonState>) -> Router {
         .route("/api/v1/pulse/estado", get(handler_pulse_estado))
         .route("/api/v1/pulse/telemetria", post(handler_pulse_telemetria))
         .route("/api/v1/dpo/consolidar", post(handler_dpo_consolidar))
+        .route("/api/v1/council/cuotas", get(handler_council_cuotas))
+        .route("/api/v1/council/delegar", post(handler_council_delegar))
+        .route(
+            "/api/v1/forge/ordenes",
+            get(handler_forge_ordenes_listar).post(handler_forge_ordenes_crear),
+        )
         .route("/api/v1/eventos/stream", get(handler_eventos_sse))
         .route("/api/v1/ws", get(handler_eventos_ws))
         .layer(CorsLayer::permissive())
@@ -164,6 +172,34 @@ async fn handler_dpo_consolidar(
     State(state): State<Arc<AuroraDaemonState>>,
 ) -> DaemonResult<Json<DpoConsolidarResponse>> {
     let resp = state.consolidar_dpo().await?;
+    Ok(Json(resp))
+}
+
+async fn handler_council_cuotas(
+    State(state): State<Arc<AuroraDaemonState>>,
+) -> Json<CouncilCuotasResponse> {
+    Json(state.obtener_cuotas_consejo().await)
+}
+
+async fn handler_council_delegar(
+    State(state): State<Arc<AuroraDaemonState>>,
+    Json(req): Json<DelegarConsejoRequest>,
+) -> DaemonResult<Json<ResultadoDelegacion>> {
+    let resp = state.delegar_consejo(req).await?;
+    Ok(Json(resp))
+}
+
+async fn handler_forge_ordenes_listar(
+    State(state): State<Arc<AuroraDaemonState>>,
+) -> Json<ForgeOrdenesResponse> {
+    Json(state.listar_ordenes_forge().await)
+}
+
+async fn handler_forge_ordenes_crear(
+    State(state): State<Arc<AuroraDaemonState>>,
+    Json(req): Json<CrearOrdenForjaRequest>,
+) -> DaemonResult<Json<RegistroOrdenForjaDto>> {
+    let resp = state.crear_y_ejecutar_orden_forge(req).await?;
     Ok(Json(resp))
 }
 

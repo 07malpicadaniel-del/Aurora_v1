@@ -6,6 +6,8 @@ members = [
     "crates/aurora-cortex",
     "crates/aurora-factory",
     "crates/aurora-pulse",
+    "crates/aurora-council",
+    "crates/aurora-forge",
     "crates/aurora-daemon",
 ]
 resolver = "2"
@@ -44,6 +46,8 @@ aurora-memory = { path = "crates/aurora-memory" }
 aurora-cortex = { path = "crates/aurora-cortex" }
 aurora-factory = { path = "crates/aurora-factory" }
 aurora-pulse = { path = "crates/aurora-pulse" }
+aurora-council = { path = "crates/aurora-council" }
+aurora-forge = { path = "crates/aurora-forge" }
 aurora-daemon = { path = "crates/aurora-daemon" }
 axum = { version = "0.8", features = ["ws"] }
 tokio-stream = { version = "0.1", features = ["sync"] }

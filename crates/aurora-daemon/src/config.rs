@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use aurora_council::{
+    ConfigCuotasConsejo, MiembroConsejo, PoliticaCuotaProveedor, DEFAULT_COUNCIL_CLI_TIMEOUT_MS,
+};
 use aurora_osint::{ConfigCdpFetcher, HttpCdpBrowserFetcher};
 use aurora_pulse::ConfigSmtp;
 use reqwest::Client;
@@ -43,6 +46,93 @@ impl ModoEjecucion {
             "estricto_real" | "strict" | "estricto" | "prod" => Some(Self::EstrictoReal),
             "simulado_offline" | "offline" | "mock" => Some(Self::SimuladoOffline),
             _ => None,
+        }
+    }
+}
+
+/// Configuración de la sección `[council]` en `aurora.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConfigCouncilDaemon {
+    /// Binario o ruta para Claude Code CLI (`claude`).
+    pub claude_bin: PathBuf,
+    /// Binario o ruta para Codex CLI (`codex`).
+    pub codex_bin: PathBuf,
+    /// Binario o ruta para Gemini CLI (`gemini`).
+    pub gemini_bin: PathBuf,
+    /// Binario o ruta para OpenCode CLI local (`opencode`).
+    pub opencode_bin: PathBuf,
+    /// Tope móvil 5h para Claude Pro.
+    pub claude_max_5h: u32,
+    /// Tope diario para Claude Pro.
+    pub claude_max_diario: u32,
+    /// Tope móvil 5h para Codex Plus.
+    pub codex_max_5h: u32,
+    /// Tope diario para Codex Plus.
+    pub codex_max_diario: u32,
+    /// Tope móvil 5h para Gemini Estudiante.
+    pub gemini_max_5h: u32,
+    /// Tope diario para Gemini Estudiante.
+    pub gemini_max_diario: u32,
+    /// Tope móvil 5h para OpenCode Local.
+    pub opencode_max_5h: u32,
+    /// Tope diario para OpenCode Local.
+    pub opencode_max_diario: u32,
+    /// Segundos de cooldown automático tras un rate-limit externo (HTTP 429 / usage limit).
+    pub cooldown_rate_limit_segundos: u64,
+    /// Timeout máximo por invocación CLI en milisegundos.
+    pub timeout_ms: u64,
+    /// Ruta explícita al archivo JSON persistente de cuotas (`<data_dir>/quota_state.json` si se omite).
+    pub quota_state_path: Option<PathBuf>,
+}
+
+impl Default for ConfigCouncilDaemon {
+    fn default() -> Self {
+        let claude = PoliticaCuotaProveedor::por_defecto_para(MiembroConsejo::ClaudePro);
+        let codex = PoliticaCuotaProveedor::por_defecto_para(MiembroConsejo::CodexPlus);
+        let gemini = PoliticaCuotaProveedor::por_defecto_para(MiembroConsejo::GeminiEstudiante);
+        let opencode = PoliticaCuotaProveedor::por_defecto_para(MiembroConsejo::OpenCodeLocal);
+        Self {
+            claude_bin: PathBuf::from("claude"),
+            codex_bin: PathBuf::from("codex"),
+            gemini_bin: PathBuf::from("gemini"),
+            opencode_bin: PathBuf::from("opencode"),
+            claude_max_5h: claude.max_tareas_ventana_5h,
+            claude_max_diario: claude.max_tareas_diarias,
+            codex_max_5h: codex.max_tareas_ventana_5h,
+            codex_max_diario: codex.max_tareas_diarias,
+            gemini_max_5h: gemini.max_tareas_ventana_5h,
+            gemini_max_diario: gemini.max_tareas_diarias,
+            opencode_max_5h: opencode.max_tareas_ventana_5h,
+            opencode_max_diario: opencode.max_tareas_diarias,
+            cooldown_rate_limit_segundos: claude.cooldown_rate_limit_segundos,
+            timeout_ms: DEFAULT_COUNCIL_CLI_TIMEOUT_MS,
+            quota_state_path: None,
+        }
+    }
+}
+
+/// Configuración de la sección `[forge]` en `aurora.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConfigForgeDaemon {
+    /// Habilita o deshabilita la ejecución de órdenes autónomas en worktrees Git.
+    pub habilitado: bool,
+    /// Directorio donde se montan los worktrees temporales (`<data_dir>/forge_worktrees` si se omite).
+    pub worktrees_dir: Option<PathBuf>,
+    /// Raíz del repositorio Git objetivo (si se omite, usa el directorio de trabajo actual).
+    pub repo_root: Option<PathBuf>,
+    /// Timeout máximo por etapa en segundos.
+    pub timeout_segundos: u64,
+}
+
+impl Default for ConfigForgeDaemon {
+    fn default() -> Self {
+        Self {
+            habilitado: true,
+            worktrees_dir: None,
+            repo_root: None,
+            timeout_segundos: 300,
         }
     }
 }
@@ -97,6 +187,10 @@ pub struct AuroraDaemonConfig {
     pub dpo_intervalo_minutos: u64,
     /// Configuración SMTP (`lettre` + `tokio1-rustls-tls`) y cumplimiento LFPDPPP `List-Unsubscribe`.
     pub smtp: ConfigSmtp,
+    /// Configuración del Consejo Multi-Agente (`aurora-council`) y límites de cuotas NVMe.
+    pub council: ConfigCouncilDaemon,
+    /// Configuración del sandbox Git aislado (`aurora-forge`, Carril Ámbar).
+    pub forge: ConfigForgeDaemon,
 }
 
 impl Default for AuroraDaemonConfig {
@@ -126,6 +220,8 @@ impl Default for AuroraDaemonConfig {
             dpo_hora_utc: 9,
             dpo_intervalo_minutos: 360,
             smtp: ConfigSmtp::default(),
+            council: ConfigCouncilDaemon::default(),
+            forge: ConfigForgeDaemon::default(),
         }
     }
 }
@@ -226,6 +322,87 @@ impl AuroraDaemonConfig {
     #[must_use]
     pub fn queue_path_efectivo(&self) -> PathBuf {
         self.data_dir_resuelto().join("gatekeeper_queue.json")
+    }
+
+    /// Ruta efectiva del archivo JSON de estado de cuotas del Consejo (`quota_state.json`).
+    #[must_use]
+    pub fn council_quota_state_efectivo(&self) -> PathBuf {
+        self.council
+            .quota_state_path
+            .as_ref()
+            .map(|p| expandir_tilde_path(p))
+            .unwrap_or_else(|| self.data_dir_resuelto().join("quota_state.json"))
+    }
+
+    /// Construye la configuración de cuotas de [`aurora_council::QuotaGovernor`] desde `[council]`.
+    #[must_use]
+    pub fn construir_config_cuotas_consejo(&self) -> ConfigCuotasConsejo {
+        let cd = self.council.cooldown_rate_limit_segundos;
+        ConfigCuotasConsejo::con_ruta(self.council_quota_state_efectivo())
+            .con_politica(
+                MiembroConsejo::ClaudePro,
+                PoliticaCuotaProveedor {
+                    max_tareas_ventana_5h: self.council.claude_max_5h,
+                    max_tareas_diarias: self.council.claude_max_diario,
+                    cooldown_rate_limit_segundos: cd,
+                    ilimitado: false,
+                },
+            )
+            .con_politica(
+                MiembroConsejo::CodexPlus,
+                PoliticaCuotaProveedor {
+                    max_tareas_ventana_5h: self.council.codex_max_5h,
+                    max_tareas_diarias: self.council.codex_max_diario,
+                    cooldown_rate_limit_segundos: cd,
+                    ilimitado: false,
+                },
+            )
+            .con_politica(
+                MiembroConsejo::GeminiEstudiante,
+                PoliticaCuotaProveedor {
+                    max_tareas_ventana_5h: self.council.gemini_max_5h,
+                    max_tareas_diarias: self.council.gemini_max_diario,
+                    cooldown_rate_limit_segundos: cd,
+                    ilimitado: false,
+                },
+            )
+            .con_politica(
+                MiembroConsejo::OpenCodeLocal,
+                PoliticaCuotaProveedor {
+                    max_tareas_ventana_5h: self.council.opencode_max_5h,
+                    max_tareas_diarias: self.council.opencode_max_diario,
+                    cooldown_rate_limit_segundos: cd,
+                    ilimitado: false,
+                },
+            )
+    }
+
+    /// Directorio temporal efectivo donde `aurora-forge` monta los `git worktree`.
+    #[must_use]
+    pub fn forge_worktrees_dir_efectivo(&self) -> PathBuf {
+        self.forge
+            .worktrees_dir
+            .as_ref()
+            .map(|p| expandir_tilde_path(p))
+            .unwrap_or_else(|| self.data_dir_resuelto().join("forge_worktrees"))
+    }
+
+    /// Raíz Git objetivo para `aurora-forge`.
+    #[must_use]
+    pub fn forge_repo_root_efectivo(&self) -> PathBuf {
+        self.forge
+            .repo_root
+            .as_ref()
+            .map(|p| expandir_tilde_path(p))
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| self.data_dir_resuelto())
+            })
+    }
+
+    /// Ruta del archivo de historial persistente de órdenes de `aurora-forge`.
+    #[must_use]
+    pub fn forge_ordenes_path_efectivo(&self) -> PathBuf {
+        self.data_dir_resuelto().join("forge_ordenes.json")
     }
 
     /// Ruta resuelta del modelo Piper `.onnx`.
@@ -388,6 +565,50 @@ impl AuroraDaemonConfig {
             self.smtp.usar_tls_implicito = parsear_bool_env("AURORA_SMTP_TLS_IMPLICITO", &v)?;
         }
 
+        // Overrides [council]
+        if let Some(v) = leer_env("AURORA_CLAUDE_BIN").filter(|s| !s.trim().is_empty()) {
+            self.council.claude_bin = PathBuf::from(v.trim());
+        }
+        if let Some(v) = leer_env("AURORA_CODEX_BIN").filter(|s| !s.trim().is_empty()) {
+            self.council.codex_bin = PathBuf::from(v.trim());
+        }
+        if let Some(v) = leer_env("AURORA_GEMINI_BIN").filter(|s| !s.trim().is_empty()) {
+            self.council.gemini_bin = PathBuf::from(v.trim());
+        }
+        if let Some(v) = leer_env("AURORA_OPENCODE_BIN").filter(|s| !s.trim().is_empty()) {
+            self.council.opencode_bin = PathBuf::from(v.trim());
+        }
+        if let Some(v) = leer_env("AURORA_COUNCIL_QUOTA_PATH").filter(|s| !s.trim().is_empty()) {
+            self.council.quota_state_path = Some(PathBuf::from(v.trim()));
+        }
+        if let Some(v) = leer_env("AURORA_COUNCIL_TIMEOUT_MS").filter(|s| !s.trim().is_empty()) {
+            self.council.timeout_ms = v.trim().parse::<u64>().map_err(|e| {
+                DaemonError::Configuracion(format!(
+                    "AURORA_COUNCIL_TIMEOUT_MS inválido ('{v}'): {e}"
+                ))
+            })?;
+        }
+
+        // Overrides [forge]
+        if let Some(v) = leer_env("AURORA_FORGE_HABILITADO").filter(|s| !s.trim().is_empty()) {
+            self.forge.habilitado = parsear_bool_env("AURORA_FORGE_HABILITADO", &v)?;
+        }
+        if let Some(v) = leer_env("AURORA_FORGE_WORKTREES_DIR").filter(|s| !s.trim().is_empty()) {
+            self.forge.worktrees_dir = Some(PathBuf::from(v.trim()));
+        }
+        if let Some(v) = leer_env("AURORA_FORGE_REPO_ROOT").filter(|s| !s.trim().is_empty()) {
+            self.forge.repo_root = Some(PathBuf::from(v.trim()));
+        }
+        if let Some(v) =
+            leer_env("AURORA_FORGE_TIMEOUT_SEGUNDOS").filter(|s| !s.trim().is_empty())
+        {
+            self.forge.timeout_segundos = v.trim().parse::<u64>().map_err(|e| {
+                DaemonError::Configuracion(format!(
+                    "AURORA_FORGE_TIMEOUT_SEGUNDOS inválido ('{v}'): {e}"
+                ))
+            })?;
+        }
+
         Ok(())
     }
 
@@ -437,6 +658,18 @@ impl AuroraDaemonConfig {
         if self.modo_offline {
             self.modo_ejecucion = ModoEjecucion::SimuladoOffline;
         }
+        if self.council.timeout_ms < 1_000 {
+            return Err(DaemonError::Configuracion(format!(
+                "council.timeout_ms={} debe ser >= 1000 ms",
+                self.council.timeout_ms
+            )));
+        }
+        if self.forge.habilitado && self.forge.timeout_segundos < 5 {
+            return Err(DaemonError::Configuracion(format!(
+                "forge.timeout_segundos={} debe ser >= 5 s",
+                self.forge.timeout_segundos
+            )));
+        }
         Ok(())
     }
 }
@@ -471,6 +704,9 @@ pub struct ReporteSubsistemas {
     pub cdp_browser: EstadoSubsistema,
     /// Transporte ejecutivo SMTP (`rustls-tls` + cabecera LFPDPPP `List-Unsubscribe`).
     pub smtp_transport: EstadoSubsistema,
+    /// Disponibilidad sondeada de los CLIs del Consejo Multi-Agente (`claude`, `codex`, `gemini`, `opencode`).
+    #[serde(default)]
+    pub consejo_clis: Vec<EstadoSubsistema>,
 }
 
 impl ReporteSubsistemas {
@@ -486,14 +722,21 @@ impl ReporteSubsistemas {
                 "FALLBACK"
             }
         };
+        let clis_reales = self
+            .consejo_clis
+            .iter()
+            .filter(|st| st.modo_real_activo)
+            .count();
         format!(
-            "bob_llm={}, piper_tts={}, chromium_headless={}, ffmpeg_nvenc={}, cdp_browser={}, smtp_transport={}",
+            "bob_llm={}, piper_tts={}, chromium_headless={}, ffmpeg_nvenc={}, cdp_browser={}, smtp_transport={}, consejo_clis_reales={}/{}",
             mark(&self.bob_llm),
             mark(&self.piper_tts),
             mark(&self.chromium_headless),
             mark(&self.ffmpeg_nvenc),
             mark(&self.cdp_browser),
             mark(&self.smtp_transport),
+            clis_reales,
+            self.consejo_clis.len(),
         )
     }
 
@@ -535,6 +778,7 @@ impl SubsystemProbe {
         let piper_tts = Self::sondear_piper(config, es_offline);
         let chromium_headless = Self::sondear_chromium(config, es_offline);
         let smtp_transport = Self::sondear_smtp(config, es_offline);
+        let consejo_clis = Self::sondear_consejo_clis(config, es_offline);
 
         ReporteSubsistemas {
             bob_llm,
@@ -543,7 +787,56 @@ impl SubsystemProbe {
             ffmpeg_nvenc,
             cdp_browser,
             smtp_transport,
+            consejo_clis,
         }
+    }
+
+    fn sondear_consejo_clis(
+        config: &AuroraDaemonConfig,
+        es_offline: bool,
+    ) -> Vec<EstadoSubsistema> {
+        let entradas: &[(&str, &Path)] = &[
+            ("Consejo CLI: Claude Code", &config.council.claude_bin),
+            ("Consejo CLI: Codex", &config.council.codex_bin),
+            ("Consejo CLI: Gemini", &config.council.gemini_bin),
+            ("Consejo CLI: OpenCode", &config.council.opencode_bin),
+        ];
+
+        entradas
+            .iter()
+            .map(|(nombre, bin_raw)| {
+                let bin_cfg = expandir_tilde_path(bin_raw);
+                if es_offline {
+                    return EstadoSubsistema {
+                        nombre: (*nombre).to_string(),
+                        disponible: true,
+                        modo_real_activo: false,
+                        detalle: "Driver determinista offline activo (respaldo BOB Local)"
+                            .to_string(),
+                        ruta_o_endpoint: bin_cfg.display().to_string(),
+                    };
+                }
+
+                if let Some(bin) = resolver_binario_en_sistema(&bin_cfg, &[]) {
+                    EstadoSubsistema {
+                        nombre: (*nombre).to_string(),
+                        disponible: true,
+                        modo_real_activo: true,
+                        detalle: "Binario CLI headless detectado en sistema".to_string(),
+                        ruta_o_endpoint: bin.display().to_string(),
+                    }
+                } else {
+                    EstadoSubsistema {
+                        nombre: (*nombre).to_string(),
+                        disponible: false,
+                        modo_real_activo: false,
+                        detalle: "CLI no instalado en PATH (cascada degradará a BOB Local)"
+                            .to_string(),
+                        ruta_o_endpoint: bin_cfg.display().to_string(),
+                    }
+                }
+            })
+            .collect()
     }
 
     async fn sondear_bob(
@@ -977,6 +1270,16 @@ habilitado = true
 host = "smtp.resend.com"
 puerto = 587
 remitente_correo = "comercial@inmobiliaria-aurora.mx"
+
+[council]
+claude_bin = "/usr/local/bin/claude"
+claude_max_5h = 8
+claude_max_diario = 24
+timeout_ms = 45000
+
+[forge]
+habilitado = true
+timeout_segundos = 180
 "#,
         )?;
 
@@ -984,6 +1287,7 @@ remitente_correo = "comercial@inmobiliaria-aurora.mx"
         env_map.insert("AURORA_BIND_ADDR", "127.0.0.1:8199".to_string());
         env_map.insert("AURORA_SMTP_PUERTO", "465".to_string());
         env_map.insert("AURORA_SMTP_TLS_IMPLICITO", "true".to_string());
+        env_map.insert("AURORA_FORGE_TIMEOUT_SEGUNDOS", "240".to_string());
 
         let cfg = AuroraDaemonConfig::cargar_con_lector_entorno(Some(&toml_path), |k| {
             env_map.get(k).cloned()
@@ -996,6 +1300,14 @@ remitente_correo = "comercial@inmobiliaria-aurora.mx"
         assert_eq!(cfg.smtp.host, "smtp.resend.com");
         assert_eq!(cfg.smtp.puerto, 465);
         assert!(cfg.smtp.usar_tls_implicito);
+        assert_eq!(cfg.council.claude_bin, PathBuf::from("/usr/local/bin/claude"));
+        assert_eq!(cfg.council.claude_max_5h, 8);
+        assert_eq!(cfg.council.claude_max_diario, 24);
+        assert_eq!(cfg.council.timeout_ms, 45_000);
+        assert!(cfg.forge.habilitado);
+        assert_eq!(cfg.forge.timeout_segundos, 240);
+        assert!(cfg.council_quota_state_efectivo().ends_with("aurora/quota_state.json"));
+        assert!(cfg.forge_worktrees_dir_efectivo().ends_with("aurora/forge_worktrees"));
         assert!(cfg.wal_dir_efectivo().ends_with("aurora/wal"));
         assert!(cfg.artefactos_dir_efectivo().ends_with("aurora/artefactos"));
         assert!(cfg.dpo_dir_efectivo().ends_with("aurora/dpo"));

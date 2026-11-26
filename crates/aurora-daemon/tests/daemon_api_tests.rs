@@ -2,15 +2,18 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+use aurora_council::{MiembroConsejo, ResultadoDelegacion, TipoTareaConsejo};
 use aurora_daemon::{
     crear_router, AprobarOrdenRequest, AprobarOrdenResponse, AuroraDaemonState,
-    DpoConsolidarResponse, GatekeeperPendientesResponse, HealthResponse, HuntRequest, HuntResponse,
+    CouncilCuotasResponse, CrearOrdenForjaRequest, DelegarConsejoRequest, DpoConsolidarResponse,
+    ForgeOrdenesResponse, GatekeeperPendientesResponse, HealthResponse, HuntRequest, HuntResponse,
     OptOutRequest, OptOutResponse, OrdenPendienteDto, PulseEstadoResponse, RechazarOrdenRequest,
     TelaranaResponse,
 };
 use aurora_domain::{
     EstadoAprobacion, SubverticalInmobiliaria, Ubicacion, VerticalComercial,
 };
+use aurora_forge::TipoOrdenIngenieria;
 use aurora_memory::{IslaVertical, SubgrafoProspecto};
 use aurora_osint::{CoMencionCruda, FormatoCrudo, RegistroCrudo};
 use aurora_pulse::{EventoTelemetria, TipoEventoTelemetria};
@@ -346,6 +349,100 @@ async fn flujo_http_completo_hunt_gatekeeper_factory_pulse_dpo_y_opt_out(
         .send()
         .await?;
     assert_eq!(subgrafo_purgado.status(), StatusCode::NOT_FOUND);
+
+    server_handle.abort();
+    let _ = fs::remove_dir_all(&base_dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn endpoints_http_council_cuotas_delegar_y_forge_ordenes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let base_dir = dir_temporal_daemon("aurora_daemon_council_forge_test");
+    let (base_url, server_handle) = levantar_servidor_efimero(&base_dir).await?;
+    let client = Client::new();
+
+    // 1. /api/v1/health expone la disponibilidad sondeada de los 4 CLIs del consejo
+    let health: HealthResponse = client
+        .get(format!("{base_url}/api/v1/health"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(health.subsistemas.consejo_clis.len(), 4);
+
+    // 2. GET /api/v1/council/cuotas devuelve los 5 miembros y la cascada terminando en BobLocal
+    let cuotas_resp = client
+        .get(format!("{base_url}/api/v1/council/cuotas"))
+        .send()
+        .await?;
+    assert_eq!(cuotas_resp.status(), StatusCode::OK);
+    let cuotas: CouncilCuotasResponse = cuotas_resp.json().await?;
+    assert_eq!(cuotas.miembros.len(), 5);
+    assert_eq!(cuotas.cascada_vigente.last(), Some(&MiembroConsejo::BobLocal));
+    assert!(cuotas
+        .miembros
+        .iter()
+        .any(|m| m.miembro == MiembroConsejo::BobLocal && m.ilimitado));
+
+    // 3. POST /api/v1/council/delegar sanitiza PII mexicana y actualiza el contador NVMe
+    let delegar_resp = client
+        .post(format!("{base_url}/api/v1/council/delegar"))
+        .json(&DelegarConsejoRequest {
+            tarea: TipoTareaConsejo::CopyAltoTicket,
+            contexto: "Contactar a direccion@patrimonio-mx.com al +52 81 8345 6789 sobre nave industrial.".to_string(),
+            prospecto_id: None,
+            prospecto: None,
+            forzar_local: Some(false),
+            timeout_ms: Some(5_000),
+        })
+        .send()
+        .await?;
+    assert_eq!(delegar_resp.status(), StatusCode::OK);
+    let delegacion: ResultadoDelegacion = delegar_resp.json().await?;
+    assert_eq!(delegacion.miembro_respondedor, MiembroConsejo::ClaudePro);
+    assert!(delegacion.pii_sanitizado);
+    assert_eq!(delegacion.marcadores_pii_aplicados, 2);
+    assert!(delegacion.contenido.contains("direccion@patrimonio-mx.com"));
+    assert!(delegacion.contenido.contains("+52 81 8345 6789"));
+
+    let cuotas_post: CouncilCuotasResponse = client
+        .get(format!("{base_url}/api/v1/council/cuotas"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let claude_post = cuotas_post
+        .miembros
+        .iter()
+        .find(|m| m.miembro == MiembroConsejo::ClaudePro);
+    assert!(claude_post.is_some_and(|c| c.usado_ventana_5h == 1 && c.usado_diario == 1));
+
+    // 4. GET /api/v1/forge/ordenes responde 200 OK con estado habilitado y lista inicial
+    let forge_resp = client
+        .get(format!("{base_url}/api/v1/forge/ordenes"))
+        .send()
+        .await?;
+    assert_eq!(forge_resp.status(), StatusCode::OK);
+    let forge: ForgeOrdenesResponse = forge_resp.json().await?;
+    assert!(forge.habilitado);
+    assert_eq!(forge.total_ordenes, 0);
+
+    // 5. POST /api/v1/forge/ordenes rechaza con 403 FORBIDDEN intentos sobre rutas protegidas
+    let forge_bloqueo = client
+        .post(format!("{base_url}/api/v1/forge/ordenes"))
+        .json(&CrearOrdenForjaRequest {
+            tipo: TipoOrdenIngenieria::SelfHealingScraper,
+            descripcion_tecnica: "Intento no permitido sobre validation.rs".to_string(),
+            rutas_permitidas: vec!["crates/aurora-domain/src/validation.rs".to_string()],
+            comando_validacion: None,
+            repo_root: None,
+        })
+        .send()
+        .await?;
+    assert_eq!(forge_bloqueo.status(), StatusCode::FORBIDDEN);
 
     server_handle.abort();
     let _ = fs::remove_dir_all(&base_dir);

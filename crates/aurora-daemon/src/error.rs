@@ -1,6 +1,8 @@
 use aurora_cortex::CortexError;
+use aurora_council::CouncilError;
 use aurora_domain::AuroraError;
 use aurora_factory::FactoryError;
+use aurora_forge::ForgeError;
 use aurora_memory::MemoryError;
 use aurora_osint::OsintError;
 use aurora_pulse::PulseError;
@@ -64,6 +66,14 @@ pub enum DaemonError {
     /// Error propagado desde `aurora-pulse`.
     #[error("error de pulso y distribución: {0}")]
     Pulso(#[from] PulseError),
+
+    /// Error propagado desde el consejo multi-agente `aurora-council`.
+    #[error("error del consejo multi-agente: {0}")]
+    Consejo(#[from] CouncilError),
+
+    /// Error propagado desde el sandbox `aurora-forge`.
+    #[error("error de aurora-forge: {0}")]
+    Forja(#[from] ForgeError),
 
     /// Fallo interno de sincronización o persistencia en NVMe.
     #[error("error interno del demonio: {0}")]
@@ -129,6 +139,26 @@ impl IntoResponse for DaemonError {
                 (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMIT")
             }
             Self::Pulso(_) => (StatusCode::INTERNAL_SERVER_ERROR, "PULSE_ERROR"),
+            Self::Consejo(CouncilError::CuotaAgotada { .. })
+            | Self::Consejo(CouncilError::RateLimitExterno { .. }) => {
+                (StatusCode::TOO_MANY_REQUESTS, "COUNCIL_RATE_LIMIT")
+            }
+            Self::Consejo(CouncilError::FalloSanitizacionPii(_)) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "PII_FIREWALL_BLOCK")
+            }
+            Self::Consejo(CouncilError::TimeoutCli { .. })
+            | Self::Consejo(CouncilError::CliNoDisponible { .. }) => {
+                (StatusCode::BAD_GATEWAY, "COUNCIL_DRIVER_ERROR")
+            }
+            Self::Consejo(_) => (StatusCode::BAD_GATEWAY, "COUNCIL_ERROR"),
+            Self::Forja(ForgeError::ArchivoProtegido { .. })
+            | Self::Forja(ForgeError::RutaNoPermitida(_)) => {
+                (StatusCode::FORBIDDEN, "FORGE_SECURITY_BLOCK")
+            }
+            Self::Forja(ForgeError::ValidacionCompuertaFallida { .. }) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "FORGE_VALIDATION_FAILED")
+            }
+            Self::Forja(_) => (StatusCode::INTERNAL_SERVER_ERROR, "FORGE_ERROR"),
             Self::Interno(_) => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
             Self::Configuracion(_) => (StatusCode::INTERNAL_SERVER_ERROR, "CONFIG_ERROR"),
         };
